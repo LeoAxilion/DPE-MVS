@@ -1,4 +1,5 @@
 #include "DPE.h"
+#include <stdexcept>
 
 #define _JACOBI_ROTATE(a, i, j, k, l) \
 	g = (a)[j][i]; \
@@ -569,6 +570,32 @@ bool ExportPointCloud(const path& point_cloud_path, std::vector<PointList>& poin
 	}
 	out.close();
 	return true;
+}
+
+bool ExportFusedPointCloud(const path& point_cloud_path, const std::vector<PointList>& pointcloud)
+{
+	ofstream out(point_cloud_path, std::ios::binary);
+	if (!out) {
+		return false;
+	}
+	out << "ply\nformat binary_little_endian 1.0\n";
+	out << "element vertex " << pointcloud.size() << "\n";
+	out << "property float x\nproperty float y\nproperty float z\n";
+	out << "property float nx\nproperty float ny\nproperty float nz\n";
+	out << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+	out << "end_header\n";
+	for (const auto& point : pointcloud) {
+		// Write fields explicitly: do not serialize struct alignment/padding.
+		const float values[6] = { point.coord.x, point.coord.y, point.coord.z,
+			point.normal.x, point.normal.y, point.normal.z };
+		out.write(reinterpret_cast<const char*>(values), sizeof(values));
+		// OpenCV stores colors in BGR order.
+		const unsigned char rgb[3] = { static_cast<unsigned char>(point.color.z),
+			static_cast<unsigned char>(point.color.y), static_cast<unsigned char>(point.color.x) };
+		out.write(reinterpret_cast<const char*>(rgb), sizeof(rgb));
+	}
+	out.close();
+	return static_cast<bool>(out);
 }
 
 void StringAppendV(std::string* dst, const char* format, va_list ap) {
@@ -1348,6 +1375,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 				if (num_consistent >= 1 && (dynamic_consistency > factor * num_consistent)) {
 					PointList point3D;
 					point3D.coord = consistent_Point;
+					point3D.normal = make_float3(ref_normal[0], ref_normal[1], ref_normal[2]);
 					float consistent_Color[3] = { (float)images[ref_index].at<cv::Vec3b>(r, c)[0], (float)images[ref_index].at<cv::Vec3b>(r, c)[1], (float)images[ref_index].at<cv::Vec3b>(r, c)[2] };
 					for (int j = 0; j < num_ngb; ++j) {
 						if (used_list[j].x == -1)
@@ -1370,6 +1398,12 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 	}
 	path ply_path = dense_folder / path("DPE") / path("DPE.ply");
 	ExportPointCloud(ply_path, PointCloud);
+	const path fused_path = dense_folder / path("DPE") / path("fused.ply");
+	if (!ExportFusedPointCloud(fused_path, PointCloud)) {
+		throw std::runtime_error("Failed to write " + fused_path.string());
+	}
+	std::cout << "Saved " << PointCloud.size() << " points with normals to "
+		<< fused_path.string() << std::endl;
 }
 
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems)
@@ -1529,6 +1563,7 @@ void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Prob
 						consistent_Color[2] /= (count + 1.0f);
 
 						point3D.coord = consistent_Point;
+						point3D.normal = make_float3(ref_normal[0], ref_normal[1], ref_normal[2]);
 						point3D.color = make_float3(consistent_Color[0], consistent_Color[1], consistent_Color[2]);
 						PointCloud.emplace_back(point3D);
 						masks[ref_index].at<uchar>(r, c) = 1;
@@ -1540,6 +1575,12 @@ void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Prob
 	}
 	path ply_path = dense_folder / path("DPE") / path("DPE.ply");
 	ExportPointCloud(ply_path, PointCloud);
+	const path fused_path = dense_folder / path("DPE") / path("fused.ply");
+	if (!ExportFusedPointCloud(fused_path, PointCloud)) {
+		throw std::runtime_error("Failed to write " + fused_path.string());
+	}
+	std::cout << "Saved " << PointCloud.size() << " points with normals to "
+		<< fused_path.string() << std::endl;
 }
 
 void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem> &problems)
@@ -1678,6 +1719,7 @@ void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem>
 					if (count >= k) {
 						PointList point3D;
 						point3D.coord = consistent_Point;
+						point3D.normal = make_float3(ref_normal[0], ref_normal[1], ref_normal[2]);
 						point3D.color = make_float3(consistent_Color[0], consistent_Color[1], consistent_Color[2]);
 						PointCloud.emplace_back(point3D);
 						masks[ref_index].at<uchar>(r, c) = 1;
@@ -1689,6 +1731,12 @@ void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem>
 	}
 	path ply_path = dense_folder / path("DPE") / path("DPE.ply");
 	ExportPointCloud(ply_path, PointCloud);
+	const path fused_path = dense_folder / path("DPE") / path("fused.ply");
+	if (!ExportFusedPointCloud(fused_path, PointCloud)) {
+		throw std::runtime_error("Failed to write " + fused_path.string());
+	}
+	std::cout << "Saved " << PointCloud.size() << " points with normals to "
+		<< fused_path.string() << std::endl;
 }
 
 void ExportDepthImagePointCloud(

@@ -54,3 +54,15 @@ This code largely benefits from the following repositories: [APD-MVS](https://gi
   <img src="./DPE-MVS/asset/eth3d-1.png" width="49%">
   <img src="./DPE-MVS/asset/eth3d-2.png" width="49%">
 </p>
+
+## COLMAP point cloud export
+
+The three fusion entry points also save `$data_folder/DPE/fused.ply` after
+`DPE.ply`. The original `ExportPointCloud` function and `DPE.ply` format are
+unchanged. A separate `ExportFusedPointCloud` writes binary little-endian fields
+`x y z nx ny nz red green blue`, using reference normals already transformed
+to world coordinates and converting OpenCV BGR colors to RGB.
+
+Rebuild `DPE-MVS/build/DPE` and run the updated fusion code to obtain the new file.
+Previously saved `DPE.ply` files do not contain normals and cannot be fixed by
+renaming them.

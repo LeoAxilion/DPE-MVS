@@ -62,6 +62,8 @@ struct Camera {
 struct PointList {
 	float3 coord;
 	float3 color;
+	// World-space reference normal retained for fused.ply.
+	float3 normal = { 0.0f, 0.0f, 0.0f };
 };
 
 enum RunState {

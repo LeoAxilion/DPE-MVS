@@ -34,6 +34,9 @@ bool ShowEdgeImage(const path &edge_path, const cv::Mat &edge);
 
 bool ExportPointCloud(const path& point_cloud_path, std::vector<PointList>& pointcloud);
 
+// Separate COLMAP-compatible export; the original DPE.ply writer is unchanged.
+bool ExportFusedPointCloud(const path& point_cloud_path, const std::vector<PointList>& pointcloud);
+
 void ExportDepthImagePointCloud(const path& point_cloud_path, const path& image_path, const path& cam_path, cv::Mat& depth, float depth_min, float depth_max);
 
 std::string ToFormatIndex(int index);
