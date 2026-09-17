@@ -823,6 +823,19 @@ void DPE::InuputInitialization() {
 	std::cout << "Num images: " << params_host.num_images << std::endl;
 	// =================================================
 	// scale images
+    // Limit the base image before the existing power-of-two pyramid.
+    for (int i = 0; i < num_images; ++i) {
+        const cv::Size target = LimitedImageSize(images[i].cols, images[i].rows, problem.params.max_image_size);
+        const float sx = target.width / static_cast<float>(images[i].cols);
+        const float sy = target.height / static_cast<float>(images[i].rows);
+        if (target != images[i].size()) {
+            cv::resize(images[i], images[i], target, 0, 0, cv::INTER_LINEAR);
+            cameras[i].K[0] *= sx; cameras[i].K[2] *= sx;
+            cameras[i].K[4] *= sy; cameras[i].K[5] *= sy;
+        }
+        cameras[i].width = target.width; cameras[i].height = target.height;
+    }
+    width = images[0].cols; height = images[0].rows;
 	if (problem.scale_size != 1) {
 		for (int i = 0; i < num_images; ++i) {
 			const float factor = 1.0f / (float)(problem.scale_size);
@@ -1062,7 +1075,7 @@ void DPE::SupportInitialization() {
 	if (problem.params.use_edge || problem.params.use_limit) {
 		int scale = 0;
 		while((1 << scale) < problem.scale_size) scale++;
-		path edge_path = problem.result_folder / path("edges_" + std::to_string(scale) + ".dmb");
+		path edge_path = problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
 		// read image edge info
 		ReadBinMat(edge_path, edge_host);
 
@@ -1072,14 +1085,14 @@ void DPE::SupportInitialization() {
 		} else {
 			max_scale = scale;
 		}
-		path edge_low_res_path = problem.result_folder / path("edges_" + std::to_string(max_scale) + ".dmb");
+		path edge_low_res_path = problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(max_scale) + ".dmb");
 		ReadBinMat(edge_low_res_path, edge_low_res_host);
 		low_width = edge_low_res_host.cols;
 		low_height = edge_low_res_host.rows;
 	}
 
 	if (problem.params.use_label) {
-		path label_path = problem.result_folder / path("labels_" + std::to_string(scale) + ".dmb");
+		path label_path = problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
 		ReadBinMat(label_path, label_host);
 	}
 }
@@ -1300,6 +1313,8 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 		if (use_block) {
 			path block_path = block_folder / path("mask_" + std::to_string(problem.ref_image_id) + ".jpg");
 			cv::Mat block_jpg = cv::imread(block_path.string(), cv::IMREAD_GRAYSCALE);
+			if (block_jpg.empty()) throw std::runtime_error("Cannot read mask: " + block_path.string());
+			cv::resize(block_jpg, block_jpg, depth.size(), 0, 0, cv::INTER_NEAREST);
 			blocks.emplace_back(block_jpg);
 		}
 	
@@ -1460,6 +1475,8 @@ void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Prob
 		if (use_block) {
 			path block_path = block_folder / path("mask_" + std::to_string(problem.ref_image_id) + ".jpg");
 			cv::Mat block_jpg = cv::imread(block_path.string(), cv::IMREAD_GRAYSCALE);
+			if (block_jpg.empty()) throw std::runtime_error("Cannot read mask: " + block_path.string());
+			cv::resize(block_jpg, block_jpg, depth.size(), 0, 0, cv::INTER_NEAREST);
 			blocks.emplace_back(block_jpg);
 		}
 
@@ -1634,6 +1651,8 @@ void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem>
 		if (use_block) {
 			path block_path = block_folder / path("mask_" + std::to_string(problem.ref_image_id) + ".jpg");
 			cv::Mat block_jpg = cv::imread(block_path.string(), cv::IMREAD_GRAYSCALE);
+			if (block_jpg.empty()) throw std::runtime_error("Cannot read mask: " + block_path.string());
+			cv::resize(block_jpg, block_jpg, depth.size(), 0, 0, cv::INTER_NEAREST);
 			blocks.emplace_back(block_jpg);
 		}
 

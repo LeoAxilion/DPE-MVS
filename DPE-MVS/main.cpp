@@ -78,7 +78,9 @@ void GetProblemEdges(const Problem &problem) {
 	path image_path = image_folder / path(ToFormatIndex(problem.ref_image_id) + ".jpg");
 	cv::Mat image_uint = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
 	cv::Mat src_img;
-	image_uint.convertTo(src_img, CV_32FC1);
+	const cv::Size capped = LimitedImageSize(image_uint.cols, image_uint.rows, problem.params.max_image_size);
+    if (capped != image_uint.size()) cv::resize(image_uint, image_uint, capped, 0, 0, cv::INTER_LINEAR);
+    image_uint.convertTo(src_img, CV_32FC1);
 	const float factor = 1.0f / (float)(problem.scale_size);
 	const int new_cols = std::round(src_img.cols * factor);
 	const int new_rows = std::round(src_img.rows * factor);
@@ -89,7 +91,7 @@ void GetProblemEdges(const Problem &problem) {
 
 	if (problem.params.use_edge) {
 		// path edge_path = problem.result_folder / path("edges.dmb");
-		path edge_path = problem.result_folder / path("edges_" + std::to_string(scale) + ".dmb");
+		path edge_path = problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
 		std::ifstream edge_file(edge_path.string());
 		bool edge_exists = edge_file.good();
 		edge_file.close();
@@ -108,7 +110,7 @@ void GetProblemEdges(const Problem &problem) {
 
 	if (problem.params.use_label) {
 		// path label_path = problem.result_folder / path("labels.dmb");
-		path label_path = problem.result_folder / path("labels_" + std::to_string(scale) + ".dmb");
+		path label_path = problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
 		std::ifstream label_file(label_path.string());
 		bool label_exists = label_file.good();
 		label_file.close();
@@ -137,7 +139,8 @@ int ComputeRoundNum(const std::vector<Problem> &problems) {
 	if (image.empty()) {
 		return 0;
 	}
-	int max_size = MAX(image.cols, image.rows);
+	const cv::Size capped = LimitedImageSize(image.cols, image.rows, problems[0].params.max_image_size);
+	int max_size = MAX(capped.width, capped.height);
 	int round_num = 1;
 	while (max_size > 800) {
 		max_size /= 2;
@@ -211,28 +214,43 @@ void ProcessProblem(const Problem &problem) {
 }
 
 int main(int argc, char **argv) {
-	if (argc < 2 || argc > 4) {
-		std::cerr << "USAGE: DPE dense_folder [gpu_index] [--geometric-anchor-cost]\n";
-		return EXIT_FAILURE;
-	}
-	path dense_folder(argv[1]);
-	path output_folder = dense_folder / path(OUT_NAME);
-	create_directory(output_folder);
-	// set cuda device for multi-gpu machine
-	int gpu_index = 0;
-	if (argc >= 3) {
-		gpu_index = std::atoi(argv[2]);
-	}
-	const bool geometric_anchor_cost = argc == 4;
-	if (geometric_anchor_cost && std::string(argv[3]) != "--geometric-anchor-cost") {
-		std::cerr << "Unknown option: " << argv[3] << std::endl;
-		return EXIT_FAILURE;
-	}
+    if (argc < 2) {
+        std::cerr << "USAGE: DPE dense_folder [gpu_index] [--geometric-anchor-cost] [--max-image-size N]\n";
+        return EXIT_FAILURE;
+    }
+    path dense_folder(argv[1]);
+    int gpu_index = 0, max_image_size = 3200;
+    bool geometric_anchor_cost = false;
+    int arg = 2;
+    if (arg < argc && std::string(argv[arg]).find("--") != 0) {
+        gpu_index = std::atoi(argv[arg++]); // Preserve legacy positional argument.
+    }
+    try {
+        while (arg < argc) {
+            const std::string option(argv[arg++]);
+            if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
+            else if (option == "--max-image-size" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                max_image_size = std::stoi(value, &end);
+                if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
+            } else throw std::invalid_argument("unknown or incomplete option: " + option);
+        }
+    } catch (const std::exception &e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    path output_folder = dense_folder / path(OUT_NAME);
+    create_directory(output_folder);
+    std::cout << "Maximum image size: " << max_image_size << " (0 = original)" << std::endl;
 	cudaSetDevice(gpu_index);
 	// generate problems
 	std::vector<Problem> problems;
 	GenerateSampleList(dense_folder, problems);
-	for (auto &problem : problems) problem.params.geometric_anchor_cost = geometric_anchor_cost;
+	for (auto &problem : problems) {
+        problem.params.geometric_anchor_cost = geometric_anchor_cost;
+        problem.params.max_image_size = max_image_size;
+    }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
 	if (!CheckImages(problems)) {
 		std::cerr << "Images may error, check it!\n";
@@ -317,8 +335,8 @@ int main(int argc, char **argv) {
 			remove(problem.result_folder / path("neighbour.bin")); 
 			remove(problem.result_folder / path("neighbour_map.bin"));
 			for (int j = 0; j < round_num; j++) {
-				remove(problem.result_folder / path("edges_" + std::to_string(j) + ".dmb"));
-				remove(problem.result_folder / path("labels_" + std::to_string(j) + ".dmb"));
+				remove(problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(j) + ".dmb"));
+				remove(problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(j) + ".dmb"));
 			}
 		}
 	}

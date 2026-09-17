@@ -26,3 +26,16 @@ common plane. Nonplanar surfaces, occlusions and biased RANSAC fits can degrade.
 No speedup or reconstruction improvement has been measured yet. Fusion OOM is
 not addressed. Validate on separate copies with identical resolutions, pair lists,
 seeds/settings and compare depth error/completeness plus stage runtime.
+
+## Maximum image size
+
+Default longest edge is now 3200; use `--max-image-size 0` for original resolution.
+Example: `build-max-size/DPE INPUT 0 --geometric-anchor-cost --max-image-size 3200`.
+Resizing is in memory, preserving original images/cameras. Never upscales. Intrinsics
+use actual rounded width/height ratios. Pyramid edges and input processing use the
+same capped dimensions; fusion rescales original color images/intrinsics to depth
+map sizes and masks use nearest-neighbor resizing. Edge caches include the cap in
+filenames. Outputs remain INPUT/DPE (back up previous results for comparison).
+Existing same-size input requirement remains. Changing the limit requires rerunning
+depth estimation, not mixing previous depth files. Build-max-size is separate so an
+already-running batch continues using its existing executable.

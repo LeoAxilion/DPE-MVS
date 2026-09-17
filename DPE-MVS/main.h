@@ -80,6 +80,7 @@ enum PixelState {
 
 struct PatchMatchParams {
 	int max_iterations = 3;
+	int max_image_size = 3200; // 0 keeps input resolution.
 	bool geometric_anchor_cost = false; // Opt-in experimental replacement of anchor NCC.
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
@@ -120,5 +121,14 @@ struct Problem {
 	bool show_medium_result = true;
 	int iteration;
 };
+
+// Shared sizing rule for image, intrinsics and edge pyramids; never upscale.
+inline cv::Size LimitedImageSize(int width, int height, int limit) {
+    const int longest = std::max(width, height);
+    if (limit <= 0 || longest <= limit) return cv::Size(width, height);
+    const double factor = static_cast<double>(limit) / longest;
+    return cv::Size(std::max(1, static_cast<int>(std::round(width * factor))),
+                    std::max(1, static_cast<int>(std::round(height * factor))));
+}
 
 #endif // !_MAIN_H_
