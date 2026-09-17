@@ -740,6 +740,7 @@ DPE::~DPE() {
 	cudaFree(cameras_cuda);
 	cudaFree(plane_hypotheses_cuda);
 	cudaFree(fit_plane_hypotheses_cuda);
+	cudaFree(fit_plane_valid_cuda);
 	cudaFree(costs_cuda);
 	cudaFree(rand_states_cuda);
 	cudaFree(selected_views_cuda);
@@ -1010,6 +1011,8 @@ void DPE::CudaSpaceInitialization() {
 	// malloc memory for fit plane 
 	cudaMalloc((void**)&fit_plane_hypotheses_cuda, sizeof(float4) * length);
 	cudaMemset(fit_plane_hypotheses_cuda, 0, sizeof(float4) * length);
+	cudaMalloc((void**)&fit_plane_valid_cuda, length);
+	cudaMemset(fit_plane_valid_cuda, 0, length);
 
 	// malloc edge array
 	if (problem.params.use_edge || problem.params.use_limit) {
@@ -1101,6 +1104,7 @@ void DPE::SetDataPassHelperInCuda() {
 	helper_host.debug_point = make_int2(DEBUG_POINT_X, DEBUG_POINT_Y);
 	helper_host.show_ncc_info = false;
 	helper_host.fit_plane_hypotheses_cuda = fit_plane_hypotheses_cuda;
+	helper_host.fit_plane_valid_cuda = fit_plane_valid_cuda;
 	helper_host.weak_reliable_cuda = weak_reliable_cuda;
 	helper_host.view_weight_cuda = view_weight_cuda;
 	helper_host.weak_nearest_strong = weak_nearest_strong;

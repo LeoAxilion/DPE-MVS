@@ -72,6 +72,7 @@ struct DataPassHelper {
 	int2 debug_point;
 	bool show_ncc_info;
 	float4* fit_plane_hypotheses_cuda;
+	unsigned char* fit_plane_valid_cuda;
 	int* label_cuda;
 	short2 *label_boundary_cuda;
 	uchar* weak_reliable_cuda;
@@ -150,6 +151,7 @@ private:
 	float4 *plane_hypotheses_host;
 	float4 *plane_hypotheses_cuda;
 	float4 *fit_plane_hypotheses_cuda;
+	unsigned char* fit_plane_valid_cuda;
 	// =========================
 	// edge host and cuda
 	cv::Mat edge_host;

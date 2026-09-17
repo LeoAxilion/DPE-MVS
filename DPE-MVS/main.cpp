@@ -211,8 +211,8 @@ void ProcessProblem(const Problem &problem) {
 }
 
 int main(int argc, char **argv) {
-	if (argc < 2) {
-		std::cerr << "USAGE: DPE dense_folder\n";
+	if (argc < 2 || argc > 4) {
+		std::cerr << "USAGE: DPE dense_folder [gpu_index] [--geometric-anchor-cost]\n";
 		return EXIT_FAILURE;
 	}
 	path dense_folder(argv[1]);
@@ -220,13 +220,20 @@ int main(int argc, char **argv) {
 	create_directory(output_folder);
 	// set cuda device for multi-gpu machine
 	int gpu_index = 0;
-	if (argc == 3) {
+	if (argc >= 3) {
 		gpu_index = std::atoi(argv[2]);
+	}
+	const bool geometric_anchor_cost = argc == 4;
+	if (geometric_anchor_cost && std::string(argv[3]) != "--geometric-anchor-cost") {
+		std::cerr << "Unknown option: " << argv[3] << std::endl;
+		return EXIT_FAILURE;
 	}
 	cudaSetDevice(gpu_index);
 	// generate problems
 	std::vector<Problem> problems;
 	GenerateSampleList(dense_folder, problems);
+	for (auto &problem : problems) problem.params.geometric_anchor_cost = geometric_anchor_cost;
+	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
 	if (!CheckImages(problems)) {
 		std::cerr << "Images may error, check it!\n";
 		return EXIT_FAILURE;

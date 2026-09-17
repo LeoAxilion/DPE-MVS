@@ -80,6 +80,7 @@ enum PixelState {
 
 struct PatchMatchParams {
 	int max_iterations = 3;
+	bool geometric_anchor_cost = false; // Opt-in experimental replacement of anchor NCC.
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
 	float sigma_color = 3.0f;

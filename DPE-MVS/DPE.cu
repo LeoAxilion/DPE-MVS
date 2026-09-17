@@ -554,6 +554,27 @@ __device__ float ComputeBilateralWeight(const float x_dist, const float y_dist, 
     return exp(-spatial_dist / (2.0f * sigma_spatial* sigma_spatial) - color_dist / (2.0f * sigma_color * sigma_color));
 }
 
+// Returns -1 when the fitted prior is unavailable: retain original anchor NCC.
+__device__ float GeometricAnchorCost(const int2 p, const float4 candidate,
+                                     const DataPassHelper *helper) {
+    const int idx = p.y * helper->width + p.x;
+    if (!helper->params->geometric_anchor_cost || !helper->fit_plane_valid_cuda[idx]) return -1.0f;
+    const float4 fitted = helper->fit_plane_hypotheses_cuda[idx];
+    const float nc = sqrtf(candidate.x*candidate.x + candidate.y*candidate.y + candidate.z*candidate.z);
+    const float nf = sqrtf(fitted.x*fitted.x + fitted.y*fitted.y + fitted.z*fitted.z);
+    if (!isfinite(nc) || !isfinite(nf) || !(nc > 1e-8f) || !(nf > 1e-8f)) return -1.0f;
+    const Camera camera = helper->cameras_cuda[0];
+    const float zf = ComputeDepthfromPlaneHypothesis(camera, fitted, p);
+    const float zc = ComputeDepthfromPlaneHypothesis(camera, candidate, p);
+    if (!isfinite(zf) || zf <= 0 || zf < helper->params->depth_min || zf > helper->params->depth_max) return -1.0f;
+    if (!isfinite(zc) || zc <= 0 || zc < helper->params->depth_min || zc > helper->params->depth_max) return 2.0f;
+    // Absolute dot makes the cost invariant to the sign of the plane equation.
+    const float cosine = fminf(1.0f, fabsf((candidate.x*fitted.x + candidate.y*fitted.y + candidate.z*fitted.z)/(nc*nf)));
+    const float normal_cost = fminf(1.0f, (1.0f-cosine)/(1.0f-0.8660254f)); // 30 degrees
+    const float depth_cost = fminf(1.0f, fabsf(zc-zf)/(0.01f*zf)); // 1% relative depth
+    return normal_cost + depth_cost; // [0, 2], matching NCC cost range
+}
+
 __device__ float ComputeBilateralNCCNew(
 	const int2 p,
 	const int src_idx,
@@ -587,7 +608,8 @@ __device__ float ComputeBilateralNCCNew(
 		float center_cost = 0.0f;
 		float strong_cost = 0.0f;
 		int strong_count = 0;
-		for (int k = 0; k < NEIGHBOUR_NUM; ++k) {
+		const float geometric_cost = GeometricAnchorCost(p, plane_hypothesis, helper);
+		for (int k = 0; k < (geometric_cost >= 0.0f ? 1 : NEIGHBOUR_NUM); ++k) {
 			const short2 neighbour_pt = GetNeighbourPoint(p, k, helper);
 			if (neighbour_pt.x == -1 || neighbour_pt.y == -1) {
 				continue;
@@ -674,7 +696,10 @@ __device__ float ComputeBilateralNCCNew(
 				strong_count++;
 			}
 		}
-		if (strong_count == 0) {
+		if (geometric_cost >= 0.0f) {
+			cost = 0.25f * center_cost + 0.75f * geometric_cost;
+		}
+		else if (strong_count == 0) {
 			cost = center_cost;
 		}
 		else {
@@ -2897,6 +2922,7 @@ __global__ void RANSACToGetFitPlane(DataPassHelper *helper) {
 	}
 	const uchar *weak_info = helper->weak_info_cuda;
 	const int center = point.x + point.y * width;
+	helper->fit_plane_valid_cuda[center] = 0;
 	const PatchMatchParams *params = helper->params;
 	float4 *plane_hypotheses = helper->plane_hypotheses_cuda;
 	float4 *fit_plane_hypothese = helper->fit_plane_hypotheses_cuda;
@@ -3056,6 +3082,7 @@ __global__ void RANSACToGetFitPlane(DataPassHelper *helper) {
 			best_plane.w = -best_plane.w;
 		}
 		fit_plane_hypothese[center] = best_plane;
+	helper->fit_plane_valid_cuda[center] = 1;
 		
 		if (helper->params->use_radius) {
 			if (must_in_triangle) {
