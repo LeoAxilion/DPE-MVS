@@ -32,9 +32,21 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
 
 - Test
 >
-    Use script colmap2mvsnet_acm.py to convert COLMAP SfM result to MVS input   
+    Use script colmap2mvsnet_acm.py to convert COLMAP SfM result to MVS input
     Run ./DPE $data_folder to get reconstruction results.
     The result will be saved in the folder $data_folder/DPE, and the point cloud is saved as "DPE.ply"
+
+- Fuse existing depth maps only
+>
+    ./DPE $data_folder 0 --fuse
+
+  This mode skips edge detection and depth estimation. It requires `depths.dmb`,
+  `normals.dmb`, and `weak.bin` in every `$data_folder/DPE/########/` directory.
+  Fusion-only runs preserve these intermediate files so that fusion can be retried.
+
+  A normal depth-estimation run also preserves these three files after fusion;
+  they are persistent fusion inputs and are independent of
+  `PatchMatchParams::geometric_anchor_cost` and intermediate-visualization output.
 
 If you need to filter out the sky during point cloud fusion, you can use a segmentation approach. Please refer to [MP-MVS](https://github.com/RongxuanTan/MP-MVS) and save the segmentation results in the $data_folder/blocks directory.
 

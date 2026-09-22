@@ -213,13 +213,30 @@ void ProcessProblem(const Problem &problem) {
 	std::cout << "Cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
 }
 
+bool ValidateFusionInputs(const std::vector<Problem> &problems) {
+	bool valid = true;
+	for (const auto &problem : problems) {
+		for (const char *filename : {"depths.dmb", "normals.dmb", "weak.bin"}) {
+			const path input_path = problem.result_folder / path(filename);
+			if (!is_regular_file(input_path) || file_size(input_path) == 0) {
+				std::cerr << "Missing or empty fusion input: "
+				          << input_path.string() << std::endl;
+				valid = false;
+			}
+		}
+	}
+	return valid;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "USAGE: DPE dense_folder [gpu_index] [--geometric-anchor-cost] [--max-image-size N]\n";
+        std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
+                     "[--geometric-anchor-cost] [--max-image-size N]\n";
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
     int gpu_index = 0, max_image_size = 3200;
+	bool fuse_only = false;
     bool geometric_anchor_cost = false;
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).find("--") != 0) {
@@ -228,7 +245,8 @@ int main(int argc, char **argv) {
     try {
         while (arg < argc) {
             const std::string option(argv[arg++]);
-            if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
+            if (option == "--fuse") fuse_only = true;
+            else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
             else if (option == "--max-image-size" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -243,7 +261,6 @@ int main(int argc, char **argv) {
     path output_folder = dense_folder / path(OUT_NAME);
     create_directory(output_folder);
     std::cout << "Maximum image size: " << max_image_size << " (0 = original)" << std::endl;
-	cudaSetDevice(gpu_index);
 	// generate problems
 	std::vector<Problem> problems;
 	GenerateSampleList(dense_folder, problems);
@@ -258,6 +275,18 @@ int main(int argc, char **argv) {
 	}
 	int num_images = problems.size();
 	std::cout << "There are " << num_images << " problems needed to be processed!" << std::endl;
+	if (fuse_only) {
+		std::cout << "Fuse-only mode: skipping edge detection and depth estimation." << std::endl;
+		if (!ValidateFusionInputs(problems)) {
+			std::cerr << "Fusion inputs are incomplete. Run depth estimation first." << std::endl;
+			return EXIT_FAILURE;
+		}
+		RunFusion(dense_folder, problems);
+		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
+		return EXIT_SUCCESS;
+	}
+
+	cudaSetDevice(gpu_index);
 
 	int round_num = ComputeRoundNum(problems);
 	for (auto &problem : problems) {
@@ -328,9 +357,12 @@ int main(int argc, char **argv) {
 	{// delete files
 		for (size_t i = 0; i < problems.size(); ++i) {
 			const auto &problem = problems[i];
-			remove(problem.result_folder / path("weak.bin"));
-			remove(problem.result_folder / path("depths.dmb"));
-			remove(problem.result_folder / path("normals.dmb"));
+			// These three files are the persistent input of --fuse. Keep them
+			// regardless of geometric_anchor_cost or visualization settings.
+			// They are deliberately not part of this cleanup block.
+			// remove(problem.result_folder / path("weak.bin"));
+			// remove(problem.result_folder / path("depths.dmb"));
+			// remove(problem.result_folder / path("normals.dmb"));
 			remove(problem.result_folder / path("selected_views.bin"));
 			remove(problem.result_folder / path("neighbour.bin")); 
 			remove(problem.result_folder / path("neighbour_map.bin"));
