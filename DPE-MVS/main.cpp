@@ -179,6 +179,7 @@ float ProcessProblem(const Problem &problem) {
 			normal.at<cv::Vec3f>(r, c) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
 		}
 	}
+	DPE.ReactivateLowConfidencePixels();
 	
 	path depth_path = problem.result_folder / path("depths.dmb");
 	WriteBinMat(depth_path, depth);

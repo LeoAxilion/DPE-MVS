@@ -1215,7 +1215,7 @@ void DPE::SupportInitialization() {
 	}
 
 	adaptive_refinement_mask_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(1));
-	cv::Mat adaptive_stability_count_host = cv::Mat::zeros(height, width, CV_8UC1);
+	adaptive_stability_count_host = cv::Mat::zeros(height, width, CV_8UC1);
 	const path adaptive_mask_path = problem.result_folder / path("adaptive_frozen.dmb");
 	const path adaptive_stability_path = problem.result_folder / path("adaptive_stability.dmb");
 	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT &&
@@ -1371,6 +1371,30 @@ cv::Mat DPE::GetSelectedViews() {
 
 float DPE::GetAdaptiveFrozenFraction() const {
 	return adaptive_frozen_fraction;
+}
+
+void DPE::ReactivateLowConfidencePixels() {
+	if (!params_host.adaptive_refinement) return;
+	int reactivated = 0;
+	for (int r = 0; r < height; ++r) {
+		uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
+		uchar *stability_row = adaptive_stability_count_host.ptr<uchar>(r);
+		const uchar *state_row = weak_info_host.ptr<uchar>(r);
+		for (int c = 0; c < width; ++c) {
+			if (mask_row[c] != 0 || state_row[c] == STRONG) continue;
+			mask_row[c] = 1;
+			stability_row[c] = 0;
+			++reactivated;
+		}
+	}
+	if (reactivated == 0) return;
+	WriteBinMat(problem.result_folder / path("adaptive_frozen.dmb"), adaptive_refinement_mask_host);
+	WriteBinMat(problem.result_folder / path("adaptive_stability.dmb"), adaptive_stability_count_host);
+	adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
+		static_cast<float>(std::max(1, width * height));
+	std::cout << "Adaptive refinement: reactivated " << reactivated
+		<< " low-confidence frozen pixels for the next pass; "
+		<< (100.0f * adaptive_frozen_fraction) << "% remain frozen.\n";
 }
 
 int DPE::GetWidth() {

@@ -2679,6 +2679,10 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 	const unsigned *selected_views = helper->selected_views_cuda;
 	const int num_images = helper->params->num_images;
 	const uchar *view_weight = &(helper->view_weight_cuda[MAX_IMAGES * center]);
+	// Frozen pixels skip propagation, which normally initializes view_weight.
+	// Re-evaluate their confidence using the saved selected views equally.
+	const bool frozen = helper->adaptive_refinement_mask_cuda &&
+		helper->adaptive_refinement_mask_cuda[center] == 0;
 	float4 origin_plane_hypothesis;
 	origin_plane_hypothesis = helper->plane_hypotheses_cuda[center];
 	origin_plane_hypothesis = TransformNormal2RefCam(cameras[0], origin_plane_hypothesis);
@@ -2702,8 +2706,9 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 			if (helper->params->geom_consistency) {
 				temp_cost += helper->params->geom_factor * ComputeGeomConsistencyCost(point, src_index, temp_plane_hypothesis, helper);
 			}
-			cost_now += (temp_cost * view_weight[view_index]);
-			weight_normal += view_weight[view_index];
+			const float weight = frozen ? 1.0f : view_weight[view_index];
+			cost_now += temp_cost * weight;
+			weight_normal += weight;
 			float c_dist[3];
 			c_dist[0] = cameras[0].c[0] - cameras[src_index].c[0];
 			c_dist[1] = cameras[0].c[1] - cameras[src_index].c[1];
@@ -2745,7 +2750,7 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 				if (helper->params->geom_consistency) {
 					temp_cost += helper->params->geom_factor * ComputeGeomConsistencyCost(point, src_index, temp_plane_hypothesis, helper);
 				}
-				p_cost += (temp_cost * view_weight[view_index]);
+				p_cost += temp_cost * (frozen ? 1.0f : view_weight[view_index]);
 			}
 		}
 		p_cost /= weight_normal;

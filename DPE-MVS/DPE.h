@@ -102,6 +102,7 @@ public:
 	void SupportInitialization();
 	void SetDataPassHelperInCuda();
 	void RunPatchMatch();
+	void ReactivateLowConfidencePixels();
 	void QuadraticDepthFilterWeak();
 	float4 GetPlaneHypothesis(int r, int c);
 	cv::Mat GetEdge();
@@ -162,6 +163,7 @@ private:
 	cv::Mat edge_host;
 	cv::Mat edge_low_res_host;
 	cv::Mat adaptive_refinement_mask_host;
+	cv::Mat adaptive_stability_count_host;
 	uchar *edge_cuda;
 	uchar *edge_low_res_cuda;
 	short2 *edge_neigh_cuda;
