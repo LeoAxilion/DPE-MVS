@@ -2157,6 +2157,10 @@ __global__ void RedPixelFilterStrong(DataPassHelper *helper)
  		// not weak point return
  		return;
  	}
+	// This pixel will not consume its own anchor list. It can still be used as
+	// a strong anchor by active neighbours through weak_info and its plane.
+	if (helper->adaptive_refinement_mask_cuda &&
+		helper->adaptive_refinement_mask_cuda[center] == 0) return;
 
 	const int max_pt_num = 64;
  	const int min_margin = 6;
@@ -2514,6 +2518,8 @@ __global__ void NeigbourUpdate(
 		return;
 	}
 	const int center = point.x + point.y * width;
+	if (helper->adaptive_refinement_mask_cuda &&
+		helper->adaptive_refinement_mask_cuda[center] == 0) return;
 	if (helper->weak_info_cuda[center] != WEAK) {
 		return;
 	}
@@ -2942,6 +2948,8 @@ __global__ void RANSACToGetFitPlane(DataPassHelper *helper) {
 	const uchar *weak_info = helper->weak_info_cuda;
 	const int center = point.x + point.y * width;
 	helper->fit_plane_valid_cuda[center] = 0;
+	if (helper->adaptive_refinement_mask_cuda &&
+		helper->adaptive_refinement_mask_cuda[center] == 0) return;
 	const PatchMatchParams *params = helper->params;
 	float4 *plane_hypotheses = helper->plane_hypotheses_cuda;
 	float4 *fit_plane_hypothese = helper->fit_plane_hypotheses_cuda;

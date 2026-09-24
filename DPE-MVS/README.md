@@ -68,7 +68,10 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   Invalid depth and the image border remain active. The aggressive setting can
   freeze incorrect but locally smooth geometry, so compare depth maps and the
   final mesh against a conservative run before production use.
-  The frozen mask stops depth/normal refinement while the weak/strong
+  The frozen mask stops depth/normal refinement and skips building an anchor
+  list or fitting a plane for the frozen pixel itself. Frozen strong pixels
+  remain available as anchors for active neighbours, and nearest-strong
+  lookup is retained where an active pixel may read it. The weak/strong
   confidence state is still refreshed for fusion.
   `--adaptive-refinement-early-stop 0.85` optionally stops the remaining
   outer passes for one reference image at the current scale once at least 85%
