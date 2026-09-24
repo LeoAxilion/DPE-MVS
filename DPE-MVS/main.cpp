@@ -231,13 +231,20 @@ bool ValidateFusionInputs(const std::vector<Problem> &problems) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
-                     "[--geometric-anchor-cost] [--max-image-size N]\n";
+                     "[--geometric-anchor-cost] [--adaptive-refinement] "
+                     "[--adaptive-point-sampling] [--simple-region-stride N] "
+                     "[--start-round N] "
+                     "[--max-image-size N]\n";
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
     int gpu_index = 0, max_image_size = 3200;
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
+    bool adaptive_refinement = false;
+    bool adaptive_point_sampling = false;
+    int simple_region_stride = 2;
+    int start_round = 0;
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).find("--") != 0) {
         gpu_index = std::atoi(argv[arg++]); // Preserve legacy positional argument.
@@ -247,6 +254,22 @@ int main(int argc, char **argv) {
             const std::string option(argv[arg++]);
             if (option == "--fuse") fuse_only = true;
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
+            else if (option == "--adaptive-refinement") adaptive_refinement = true;
+            else if (option == "--adaptive-point-sampling") adaptive_point_sampling = true;
+            else if (option == "--simple-region-stride" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                simple_region_stride = std::stoi(value, &end);
+                if (end != value.size() || simple_region_stride < 1)
+                    throw std::invalid_argument("simple-region-stride must be >= 1");
+            }
+            else if (option == "--start-round" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                start_round = std::stoi(value, &end);
+                if (end != value.size() || start_round < 0)
+                    throw std::invalid_argument("start-round must be >= 0");
+            }
             else if (option == "--max-image-size" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -266,9 +289,13 @@ int main(int argc, char **argv) {
 	GenerateSampleList(dense_folder, problems);
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
+        problem.params.adaptive_refinement = adaptive_refinement;
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
+	std::cout << "Adaptive refinement: " << adaptive_refinement << std::endl;
+	std::cout << "Adaptive point sampling: " << adaptive_point_sampling
+	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
 	if (!CheckImages(problems)) {
 		std::cerr << "Images may error, check it!\n";
 		return EXIT_FAILURE;
@@ -281,7 +308,7 @@ int main(int argc, char **argv) {
 			std::cerr << "Fusion inputs are incomplete. Run depth estimation first." << std::endl;
 			return EXIT_FAILURE;
 		}
-		RunFusion(dense_folder, problems);
+		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
 		return EXIT_SUCCESS;
 	}
@@ -289,6 +316,11 @@ int main(int argc, char **argv) {
 	cudaSetDevice(gpu_index);
 
 	int round_num = ComputeRoundNum(problems);
+	if (start_round >= round_num) {
+		std::cerr << "Start round " << start_round << " is outside the pyramid (0.."
+			<< (round_num - 1) << ").\n";
+		return EXIT_FAILURE;
+	}
 	for (auto &problem : problems) {
 		problem.params.max_scale_size = 1;
 		for (int i = 0; i < round_num; ++i) {
@@ -299,8 +331,12 @@ int main(int argc, char **argv) {
 	}
 
 	std::cout << "Round nums: " << round_num << std::endl;
-	int iteration_index = 0;
-	for (int i = 0; i < round_num; ++i) {
+	int iteration_index = start_round * 4;
+	if (start_round > 0) {
+		std::cout << "Resuming from pyramid round " << start_round
+			<< " using the saved preceding-scale depth maps." << std::endl;
+	}
+	for (int i = start_round; i < round_num; ++i) {
 		for (auto &problem : problems) {
 			problem.iteration = iteration_index;
 			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
@@ -353,7 +389,7 @@ int main(int argc, char **argv) {
 		std::cout << "Round: " << i << " done\n";
 	}
 
-	RunFusion(dense_folder, problems);
+	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1);
 	{// delete files
 		for (size_t i = 0; i < problems.size(); ++i) {
 			const auto &problem = problems[i];

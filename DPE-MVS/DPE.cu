@@ -1083,6 +1083,11 @@ __global__ void RandomInitialization(
 		float depth = plane_hypothesis.w;
 		plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depth, plane_hypothesis);
 		plane_hypotheses[center] = plane_hypothesis;
+		if (helper->adaptive_refinement_mask_cuda &&
+			helper->adaptive_refinement_mask_cuda[center] == 0) {
+			costs[center] = 0.0f;
+			return;
+		}
 		costs[center] = ComputeMultiViewInitialCost(p, helper);
 	}
 }
@@ -1899,7 +1904,9 @@ __global__ void BlackPixelUpdateWeak(const int iter, DataPassHelper *helper)
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
-	if (helper->weak_info_cuda[p.x + p.y * helper->width] == WEAK) {
+	const int center = p.x + p.y * helper->width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
+	if (helper->weak_info_cuda[center] == WEAK) {
 		CheckerboardPropagationWeak(p, iter, helper);
 	}
 }
@@ -1917,7 +1924,9 @@ __global__ void RedPixelUpdateWeak(const int iter, DataPassHelper *helper)
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
-	if (helper->weak_info_cuda[p.x + p.y * helper->width] == WEAK) {
+	const int center = p.x + p.y * helper->width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
+	if (helper->weak_info_cuda[center] == WEAK) {
 		CheckerboardPropagationWeak(p, iter, helper);
 	}
 }
@@ -1935,7 +1944,9 @@ __global__ void BlackPixelUpdateStrong(const int iter, DataPassHelper *helper)
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
-	if (helper->weak_info_cuda[p.x + p.y * helper->width] == WEAK) {
+	const int center = p.x + p.y * helper->width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
+	if (helper->weak_info_cuda[center] == WEAK) {
 		return;
 	}
 
@@ -1955,7 +1966,9 @@ __global__ void RedPixelUpdateStrong(const int iter, DataPassHelper *helper)
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
-	if (helper->weak_info_cuda[p.x + p.y * helper->width] == WEAK) {
+	const int center = p.x + p.y * helper->width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
+	if (helper->weak_info_cuda[center] == WEAK) {
 		return;
 	}
 
@@ -2103,6 +2116,8 @@ __global__ void BlackPixelFilterStrong(DataPassHelper *helper)
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
+	const int center = p.x + p.y * helper->width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
 	if (helper->weak_info_cuda[p.x + p.y * helper->width] != WEAK) {
 		CheckerboardFilterStrong(p, helper);
 	}
@@ -2120,6 +2135,8 @@ __global__ void RedPixelFilterStrong(DataPassHelper *helper)
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
+	const int center = p.x + p.y * helper->width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
 	if (helper->weak_info_cuda[p.x + p.y * helper->width] != WEAK) {
 		CheckerboardFilterStrong(p, helper);
 	}
@@ -2516,6 +2533,7 @@ __global__ void GenEdgeInform(
 	}
 
 	const int center = point.x + point.y * width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
 	
 	// 获取当前像素周围最近的edge
 	const unsigned offset = center * 8;
@@ -2625,6 +2643,7 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 
 	const int min_margin = 6;
 	const int center = point.x + point.y * width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
 
 	if (point.x < min_margin || point.y < min_margin || point.x >= width - min_margin || point.y >= height - min_margin) {
 		helper->weak_info_cuda[center] = UNKNOWN;
@@ -2780,6 +2799,7 @@ __global__ void LocalRefine(DataPassHelper *helper) {
 	}
 
 	const int center = point.x + point.y * width;
+	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
 
 	const Camera *cameras = helper->cameras_cuda;
 	const unsigned *selected_views = helper->selected_views_cuda;

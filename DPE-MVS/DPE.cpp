@@ -1,4 +1,6 @@
 #include "DPE.h"
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #define _JACOBI_ROTATE(a, i, j, k, l) \
@@ -6,6 +8,67 @@
 	h = (a)[l][k]; \
 	(a)[j][i] = g - s * (h + g * tau); \
 	(a)[l][k] = h + s *(g - h * tau);
+
+namespace {
+bool IsFiniteFloat(float value) {
+	std::uint32_t bits = 0;
+	static_assert(sizeof(bits) == sizeof(value), "unexpected float size");
+	std::memcpy(&bits, &value, sizeof(bits));
+	return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
+bool IsValidNormal(const cv::Vec3f &normal) {
+	if (!IsFiniteFloat(normal[0]) || !IsFiniteFloat(normal[1]) || !IsFiniteFloat(normal[2])) return false;
+	const float length_squared = normal.dot(normal);
+	return IsFiniteFloat(length_squared) && length_squared > 1e-12f;
+}
+
+bool IsStablePlanarNeighbourhood(const cv::Mat &depth, const cv::Mat &normal,
+		const cv::Mat &edge, const Camera &camera, int r, int c) {
+	if (r < 1 || c < 1 || r + 1 >= depth.rows || c + 1 >= depth.cols ||
+		depth.type() != CV_32FC1 || normal.type() != CV_32FC3) return false;
+	if (!edge.empty() && edge.type() == CV_8UC1) {
+		for (int dy = -1; dy <= 1; ++dy)
+			for (int dx = -1; dx <= 1; ++dx)
+				if (edge.at<uchar>(r + dy, c + dx) != 0) return false;
+	}
+	const float z0 = depth.at<float>(r, c);
+	const cv::Vec3f n0w = normal.at<cv::Vec3f>(r, c);
+	const float n0len = std::sqrt(n0w.dot(n0w));
+	if (!IsFiniteFloat(z0) || z0 <= 0.0f || !IsFiniteFloat(n0len) || n0len < 1e-6f) return false;
+	const cv::Vec3f n0 = n0w * (1.0f / n0len);
+	const cv::Vec3f n0c(
+		camera.R[0] * n0[0] + camera.R[1] * n0[1] + camera.R[2] * n0[2],
+		camera.R[3] * n0[0] + camera.R[4] * n0[1] + camera.R[5] * n0[2],
+		camera.R[6] * n0[0] + camera.R[7] * n0[1] + camera.R[8] * n0[2]);
+	const float plane_constant = z0 * (n0c[0] * (c - camera.K[2]) / camera.K[0] +
+		n0c[1] * (r - camera.K[5]) / camera.K[4] + n0c[2]);
+	if (!IsFiniteFloat(plane_constant) || std::fabs(plane_constant) < 1e-8f) return false;
+	constexpr float kNormalCosine = 0.9659258f; // 15 degrees
+	constexpr float kRelativeDepthTolerance = 0.0125f;
+	for (int dy = -1; dy <= 1; ++dy) {
+		for (int dx = -1; dx <= 1; ++dx) {
+			if (dx == 0 && dy == 0) continue;
+			const int nr = r + dy, nc = c + dx;
+			const float zn = depth.at<float>(nr, nc);
+			const cv::Vec3f nnw = normal.at<cv::Vec3f>(nr, nc);
+			const float nnlen = std::sqrt(nnw.dot(nnw));
+			if (!IsFiniteFloat(zn) || zn <= 0.0f || !IsFiniteFloat(nnlen) || nnlen < 1e-6f) return false;
+			const cv::Vec3f nn = nnw * (1.0f / nnlen);
+			const float normal_cosine = n0.dot(nn);
+			if (!IsFiniteFloat(normal_cosine) || std::fabs(normal_cosine) < kNormalCosine) return false;
+			const float ray_dot = n0c[0] * (nc - camera.K[2]) / camera.K[0] +
+				n0c[1] * (nr - camera.K[5]) / camera.K[4] + n0c[2];
+			if (!IsFiniteFloat(ray_dot) || std::fabs(ray_dot) < 1e-6f) return false;
+			const float predicted = plane_constant / ray_dot;
+			if (!IsFiniteFloat(predicted) || predicted <= 0.0f) return false;
+			const float relative_error = std::fabs(predicted - zn) / zn;
+			if (!IsFiniteFloat(relative_error) || relative_error > kRelativeDepthTolerance) return false;
+		}
+	}
+	return true;
+}
+}
 
 cv::Mat Roberts(const cv::Mat& src_image) {
 	cv::Mat dst_image = src_image.clone();
@@ -752,6 +815,7 @@ DPE::~DPE() {
 	cudaFree(weak_reliable_cuda);
 	cudaFree(view_weight_cuda);
 	cudaFree(weak_nearest_strong);
+	cudaFree(adaptive_refinement_mask_cuda);
 #ifdef DEBUG_COST_LINE
 	cudaFree(weak_ncc_cost_cuda);
 #endif // DEBUG_COST_LINE
@@ -1046,6 +1110,11 @@ void DPE::CudaSpaceInitialization() {
 	if (problem.params.use_radius) {
 		cudaMalloc((void**)(&radius_cuda), length * sizeof(int));
 	}
+	if (params_host.adaptive_refinement) {
+		cudaMalloc((void**)(&adaptive_refinement_mask_cuda), length * sizeof(uchar));
+		cudaMemcpy(adaptive_refinement_mask_cuda, adaptive_refinement_mask_host.ptr<uchar>(0),
+			length * sizeof(uchar), cudaMemcpyHostToDevice);
+	}
 
 	// malloc memory for weak info
 	cudaMalloc((void **)(&weak_info_cuda), length * sizeof(uchar));
@@ -1095,6 +1164,38 @@ void DPE::SupportInitialization() {
 		path label_path = problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
 		ReadBinMat(label_path, label_host);
 	}
+
+	adaptive_refinement_mask_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(1));
+	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT &&
+		problem.scale_size < problem.params.max_scale_size) {
+		cv::Mat current_depth(height, width, CV_32FC1);
+		cv::Mat current_normal(height, width, CV_32FC3);
+		for (int r = 0; r < height; ++r) {
+			float *depth_row = current_depth.ptr<float>(r);
+			cv::Vec3f *normal_row = current_normal.ptr<cv::Vec3f>(r);
+			for (int c = 0; c < width; ++c) {
+				const float4 &plane = plane_hypotheses_host[r * width + c];
+				depth_row[c] = plane.w;
+				normal_row[c] = cv::Vec3f(plane.x, plane.y, plane.z);
+			}
+		}
+		int frozen = 0;
+		const int total = width * height;
+		for (int r = 1; r + 1 < height; ++r) {
+			uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
+			const uchar *weak_row = weak_info_host.ptr<uchar>(r);
+			for (int c = 1; c + 1 < width; ++c) {
+				if (weak_row[c] != STRONG) continue;
+				const float4 &plane = plane_hypotheses_host[r * width + c];
+				if (plane.w < params_host.depth_min || plane.w > params_host.depth_max) continue;
+				if (!IsStablePlanarNeighbourhood(current_depth, current_normal, cv::Mat(), cameras[0], r, c)) continue;
+				mask_row[c] = 0;
+				++frozen;
+			}
+		}
+		std::cout << "Adaptive refinement mask: " << frozen << " / " << total
+			<< " pixels frozen (" << (100.0 * frozen / std::max(1, total)) << "%)" << std::endl;
+	}
 }
 
 void DPE::SetDataPassHelperInCuda() {
@@ -1128,6 +1229,7 @@ void DPE::SetDataPassHelperInCuda() {
 	helper_host.label_boundary_cuda = label_boundary_cuda;
 	helper_host.complex_cuda = complex_cuda;
 	helper_host.radius_cuda = radius_cuda;
+	helper_host.adaptive_refinement_mask_cuda = adaptive_refinement_mask_cuda;
 #ifdef DEBUG_COST_LINE
 	helper_host.weak_ncc_cost_cuda = weak_ncc_cost_cuda;
 #endif // DEBUG_COST_LINE
@@ -1264,8 +1366,9 @@ float GetAngle(const cv::Vec3f &v1, const cv::Vec3f &v2)
 }
 
 // ETH version
-void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
+void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride)
 {
+	if (simple_region_stride < 1) throw std::invalid_argument("simple_region_stride must be >= 1");
 	int num_images = problems.size();
 	path image_folder = dense_folder / path("images");
 	path cam_folder = dense_folder / path("cams");
@@ -1320,6 +1423,8 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 	
 		cv::Mat scaled_image;
 		RescaleImageAndCamera(image, scaled_image, depth, camera);
+		if (simple_region_stride > 1 && normal.size() != depth.size())
+			cv::resize(normal, normal, depth.size(), 0, 0, cv::INTER_NEAREST);
 		images.emplace_back(scaled_image);
 		cameras.emplace_back(camera);
 		depths.emplace_back(depth);
@@ -1331,6 +1436,8 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 	}
 	std::vector<PointList> PointCloud;
 	PointCloud.clear();
+	uint64_t simple_candidates = 0;
+	uint64_t simple_points_skipped = 0;
 
 	for (int i = 0; i < num_images; ++i) {
 		std::cout << "Fusing image " << std::setw(8) << std::setfill('0') << i << "..." << std::endl;
@@ -1350,9 +1457,18 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 				}
 
 				float ref_depth = depths[ref_index].at<float>(r, c);
-				if (ref_depth <= 0.0)
+				if (!IsFiniteFloat(ref_depth) || ref_depth <= 0.0f)
 					continue;
+				if (simple_region_stride > 1 &&
+					((r % simple_region_stride) != 0 || (c % simple_region_stride) != 0)) {
+					++simple_candidates;
+					if (IsStablePlanarNeighbourhood(depths[ref_index], normals[ref_index], cv::Mat(), cameras[ref_index], r, c)) {
+						++simple_points_skipped;
+						continue;
+					}
+				}
 				const cv::Vec3f ref_normal = normals[ref_index].at<cv::Vec3f>(r, c);
+				if (!IsValidNormal(ref_normal)) continue;
 				float3 PointX = Get3DPointonWorld(c, r, ref_depth, cameras[ref_index]);
 				float3 consistent_Point = PointX;
 				int num_consistent = 0;
@@ -1371,9 +1487,10 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 						if (masks[src_index].at<uchar>(src_r, src_c) == 1)
 							continue;
 						float src_depth = depths[src_index].at<float>(src_r, src_c);
-						if (src_depth <= 0.0)
+						if (!IsFiniteFloat(src_depth) || src_depth <= 0.0f)
 							continue;
 						const cv::Vec3f src_normal = normals[src_index].at<cv::Vec3f>(src_r, src_c);
+						if (!IsValidNormal(src_normal)) continue;
 						float3 tmp_X = Get3DPointonWorld(src_c, src_r, src_depth, cameras[src_index]);
 						float2 tmp_pt;
 						ProjectCamera(tmp_X, cameras[ref_index], tmp_pt, proj_depth);
@@ -1423,6 +1540,11 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems)
 	}
 	std::cout << "Saved " << PointCloud.size() << " points with normals to "
 		<< fused_path.string() << std::endl;
+	if (simple_region_stride > 1) {
+		std::cout << "Adaptive point sampling (stride " << simple_region_stride << "): skipped "
+			<< simple_points_skipped << " planar pixels / " << simple_candidates << " off-grid pixels checked ("
+			<< (100.0 * simple_points_skipped / std::max<uint64_t>(1, simple_candidates)) << "%)." << std::endl;
+	}
 }
 
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems)

@@ -44,7 +44,7 @@ std::string ToFormatIndex(int index);
 template <typename TYPE>
 void RescaleMatToTargetSize(const cv::Mat &src, cv::Mat &dst, const cv::Size2i &target_size);
 
-void RunFusion(const path &dense_folder, const std::vector<Problem> &problems);
+void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride = 1);
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems);
 void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem> &problems);
 
@@ -83,6 +83,7 @@ struct DataPassHelper {
 	short2 *edge_neigh_cuda;
 	float *complex_cuda;
 	int *radius_cuda;
+	uchar *adaptive_refinement_mask_cuda;
 #ifdef DEBUG_COST_LINE
 	float *weak_ncc_cost_cuda;
 #endif // DEBUG_COST_LINE
@@ -156,10 +157,12 @@ private:
 	// edge host and cuda
 	cv::Mat edge_host;
 	cv::Mat edge_low_res_host;
+	cv::Mat adaptive_refinement_mask_host;
 	uchar *edge_cuda;
 	uchar *edge_low_res_cuda;
 	short2 *edge_neigh_cuda;
 	int *radius_cuda;
+	uchar *adaptive_refinement_mask_cuda = nullptr;
 	// =========================
 	cv::Mat label_host;
 	int *label_cuda;

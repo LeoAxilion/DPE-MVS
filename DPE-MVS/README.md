@@ -48,6 +48,27 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   they are persistent fusion inputs and are independent of
   `PatchMatchParams::geometric_anchor_cost` and intermediate-visualization output.
 
+- Experimental adaptive refinement and point sampling
+>
+    ./DPE $data_folder 0 --max-image-size 3200 --adaptive-refinement \
+      --adaptive-point-sampling --simple-region-stride 2
+
+  `--adaptive-refinement` keeps the depth maps dense but skips fine-scale
+  PatchMatch updates for pixels that were previously classified STRONG and
+  whose 3x3 depth/normal neighbourhood agrees with one plane. Pixels near the
+  depth/normal discontinuities, invalid depth, or weak/unknown regions continue
+  through the regular updates. `--adaptive-point-sampling` applies the
+  same local plane test during fusion and samples accepted planar regions on a
+  regular grid; stride 2 keeps one quarter of those planar candidates while
+  retaining all candidates in locally complex areas. Both options are off by
+  default. This is a speed/quality trade-off and should be checked against the
+  unmodified result for each scene. Fusion-only mode supports the point-sampling
+  options without rerunning depth estimation.
+
+  `--start-round N` resumes from an already completed preceding pyramid scale.
+  Use it only when every per-image depth, normal, weak-state, and selected-view
+  file in the output folder belongs to the immediately preceding scale.
+
 If you need to filter out the sky during point cloud fusion, you can use a segmentation approach. Please refer to [MP-MVS](https://github.com/RongxuanTan/MP-MVS) and save the segmentation results in the $data_folder/blocks directory.
 
 ## Acknowledgements

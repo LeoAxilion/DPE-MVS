@@ -82,6 +82,7 @@ struct PatchMatchParams {
 	int max_iterations = 3;
 	int max_image_size = 3200; // 0 keeps input resolution.
 	bool geometric_anchor_cost = false; // Opt-in experimental replacement of anchor NCC.
+	bool adaptive_refinement = false; // Skip fine-scale PatchMatch updates on stable planar strong pixels.
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
 	float sigma_color = 3.0f;
