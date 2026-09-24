@@ -231,6 +231,12 @@ bool ValidateFusionInputs(const std::vector<Problem> &problems) {
 }
 
 int main(int argc, char **argv) {
+    const auto program_start = std::chrono::steady_clock::now();
+    const auto print_total_elapsed = [&]() {
+        const std::chrono::duration<double> elapsed =
+            std::chrono::steady_clock::now() - program_start;
+        std::cout << "Total elapsed time: " << elapsed.count() << " s\n";
+    };
     if (argc < 2) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
                      "[--geometric-anchor-cost] [--max-image-size N] "
@@ -288,6 +294,7 @@ int main(int argc, char **argv) {
 		}
 		RunFusion(dense_folder, problems);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
+		print_total_elapsed();
 		return EXIT_SUCCESS;
 	}
 
@@ -378,5 +385,6 @@ int main(int argc, char **argv) {
 		}
 	}
 	std::cout << "All done\n";
+	print_total_elapsed();
 	return EXIT_SUCCESS;
 }
