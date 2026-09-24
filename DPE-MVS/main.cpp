@@ -3,7 +3,8 @@
 
 using namespace boost::filesystem;
 
-void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems)
+void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems,
+	bool show_medium_result)
 {
 	path cluster_list_path = dense_folder / path("pair.txt");
 	problems.clear();
@@ -19,6 +20,7 @@ void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems
 
 	for (int i = 0; i < num_images; ++i) {
 		Problem problem;
+		problem.show_medium_result = show_medium_result;
 		problem.index = i;
 		problem.src_image_ids.clear();
 		iss.clear();
@@ -231,13 +233,15 @@ bool ValidateFusionInputs(const std::vector<Problem> &problems) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
-                     "[--geometric-anchor-cost] [--max-image-size N]\n";
+                     "[--geometric-anchor-cost] [--max-image-size N] "
+                     "[--show-medium-result]\n";
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
     int gpu_index = 0, max_image_size = 3200;
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
+    bool show_medium_result = false;
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).find("--") != 0) {
         gpu_index = std::atoi(argv[arg++]); // Preserve legacy positional argument.
@@ -247,6 +251,7 @@ int main(int argc, char **argv) {
             const std::string option(argv[arg++]);
             if (option == "--fuse") fuse_only = true;
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
+            else if (option == "--show-medium-result") show_medium_result = true;
             else if (option == "--max-image-size" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -263,7 +268,7 @@ int main(int argc, char **argv) {
     std::cout << "Maximum image size: " << max_image_size << " (0 = original)" << std::endl;
 	// generate problems
 	std::vector<Problem> problems;
-	GenerateSampleList(dense_folder, problems);
+	GenerateSampleList(dense_folder, problems, show_medium_result);
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
         problem.params.max_image_size = max_image_size;

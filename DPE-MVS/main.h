@@ -118,7 +118,7 @@ struct Problem {
 	path result_folder;
 	int scale_size = 1;
 	PatchMatchParams params;
-	bool show_medium_result = false;
+	bool show_medium_result;
 	int iteration;
 };
 
