@@ -2643,7 +2643,6 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 
 	const int min_margin = 6;
 	const int center = point.x + point.y * width;
-	if (helper->adaptive_refinement_mask_cuda && helper->adaptive_refinement_mask_cuda[center] == 0) return;
 
 	if (point.x < min_margin || point.y < min_margin || point.x >= width - min_margin || point.y >= height - min_margin) {
 		helper->weak_info_cuda[center] = UNKNOWN;

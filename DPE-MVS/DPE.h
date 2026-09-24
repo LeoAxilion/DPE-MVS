@@ -105,6 +105,7 @@ public:
 	cv::Mat GetEdge();
 	cv::Mat GetPixelStates();
 	cv::Mat GetSelectedViews();
+	float GetAdaptiveFrozenFraction() const;
 	cv::Mat GetRadiusMap();
 	int GetWidth();
 	int GetHeight();
@@ -119,6 +120,7 @@ private:
 	int low_width;
 	int low_height;
 	Problem problem;
+	float adaptive_frozen_fraction = 0.0f;
 	// =========================
 	// image host and cuda
 	std::vector<cv::Mat> images;

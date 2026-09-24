@@ -23,8 +23,40 @@ bool IsValidNormal(const cv::Vec3f &normal) {
 	return IsFiniteFloat(length_squared) && length_squared > 1e-12f;
 }
 
+// Transfer a frozen state between pyramid levels conservatively. On upsampling,
+// every child pixel maps to its parent; on downsampling, a target stays frozen
+// if any source pixel in its footprint was frozen.
+cv::Mat PropagateFrozenMask(const cv::Mat &source, const cv::Size &target_size) {
+	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
+	cv::Mat target(target_size, CV_8UC1, cv::Scalar(1));
+	for (int y = 0; y < target.rows; ++y) {
+		const int source_y_begin = y * source.rows / target.rows;
+		const int source_y_end = std::min(source.rows,
+			((y + 1) * source.rows + target.rows - 1) / target.rows);
+		for (int x = 0; x < target.cols; ++x) {
+			const int source_x_begin = x * source.cols / target.cols;
+			const int source_x_end = std::min(source.cols,
+				((x + 1) * source.cols + target.cols - 1) / target.cols);
+			bool frozen = false;
+			for (int sy = source_y_begin; sy < std::max(source_y_begin + 1, source_y_end) && !frozen; ++sy) {
+				const uchar *source_row = source.ptr<uchar>(std::min(sy, source.rows - 1));
+				for (int sx = source_x_begin; sx < std::max(source_x_begin + 1, source_x_end); ++sx) {
+					if (source_row[std::min(sx, source.cols - 1)] == 0) {
+						frozen = true;
+						break;
+					}
+				}
+			}
+			if (frozen) target.at<uchar>(y, x) = 0;
+		}
+	}
+	return target;
+}
+
 bool IsStablePlanarNeighbourhood(const cv::Mat &depth, const cv::Mat &normal,
-		const cv::Mat &edge, const Camera &camera, int r, int c) {
+		const cv::Mat &edge, const Camera &camera, int r, int c,
+		int min_agreements = 8, float max_normal_angle_degrees = 15.0f,
+		float max_relative_depth_error = 0.0125f) {
 	if (r < 1 || c < 1 || r + 1 >= depth.rows || c + 1 >= depth.cols ||
 		depth.type() != CV_32FC1 || normal.type() != CV_32FC3) return false;
 	if (!edge.empty() && edge.type() == CV_8UC1) {
@@ -44,8 +76,8 @@ bool IsStablePlanarNeighbourhood(const cv::Mat &depth, const cv::Mat &normal,
 	const float plane_constant = z0 * (n0c[0] * (c - camera.K[2]) / camera.K[0] +
 		n0c[1] * (r - camera.K[5]) / camera.K[4] + n0c[2]);
 	if (!IsFiniteFloat(plane_constant) || std::fabs(plane_constant) < 1e-8f) return false;
-	constexpr float kNormalCosine = 0.9659258f; // 15 degrees
-	constexpr float kRelativeDepthTolerance = 0.0125f;
+	const float kNormalCosine = std::cos(max_normal_angle_degrees * static_cast<float>(M_PI) / 180.0f);
+	int agreements = 0;
 	for (int dy = -1; dy <= 1; ++dy) {
 		for (int dx = -1; dx <= 1; ++dx) {
 			if (dx == 0 && dy == 0) continue;
@@ -53,20 +85,21 @@ bool IsStablePlanarNeighbourhood(const cv::Mat &depth, const cv::Mat &normal,
 			const float zn = depth.at<float>(nr, nc);
 			const cv::Vec3f nnw = normal.at<cv::Vec3f>(nr, nc);
 			const float nnlen = std::sqrt(nnw.dot(nnw));
-			if (!IsFiniteFloat(zn) || zn <= 0.0f || !IsFiniteFloat(nnlen) || nnlen < 1e-6f) return false;
+			if (!IsFiniteFloat(zn) || zn <= 0.0f || !IsFiniteFloat(nnlen) || nnlen < 1e-6f) continue;
 			const cv::Vec3f nn = nnw * (1.0f / nnlen);
 			const float normal_cosine = n0.dot(nn);
-			if (!IsFiniteFloat(normal_cosine) || std::fabs(normal_cosine) < kNormalCosine) return false;
+			if (!IsFiniteFloat(normal_cosine) || std::fabs(normal_cosine) < kNormalCosine) continue;
 			const float ray_dot = n0c[0] * (nc - camera.K[2]) / camera.K[0] +
 				n0c[1] * (nr - camera.K[5]) / camera.K[4] + n0c[2];
-			if (!IsFiniteFloat(ray_dot) || std::fabs(ray_dot) < 1e-6f) return false;
+			if (!IsFiniteFloat(ray_dot) || std::fabs(ray_dot) < 1e-6f) continue;
 			const float predicted = plane_constant / ray_dot;
-			if (!IsFiniteFloat(predicted) || predicted <= 0.0f) return false;
+			if (!IsFiniteFloat(predicted) || predicted <= 0.0f) continue;
 			const float relative_error = std::fabs(predicted - zn) / zn;
-			if (!IsFiniteFloat(relative_error) || relative_error > kRelativeDepthTolerance) return false;
+			if (!IsFiniteFloat(relative_error) || relative_error > max_relative_depth_error) continue;
+			++agreements;
 		}
 	}
-	return true;
+	return agreements >= min_agreements;
 }
 }
 
@@ -1166,8 +1199,39 @@ void DPE::SupportInitialization() {
 	}
 
 	adaptive_refinement_mask_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(1));
+	cv::Mat adaptive_stability_count_host = cv::Mat::zeros(height, width, CV_8UC1);
+	const path adaptive_mask_path = problem.result_folder / path("adaptive_frozen.dmb");
+	const path adaptive_stability_path = problem.result_folder / path("adaptive_stability.dmb");
 	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT &&
-		problem.scale_size < problem.params.max_scale_size) {
+		exists(adaptive_mask_path)) {
+		cv::Mat previous_mask;
+		if (ReadBinMat(adaptive_mask_path, previous_mask) && previous_mask.type() == CV_8UC1) {
+			if (previous_mask.size() != adaptive_refinement_mask_host.size()) {
+				const int previous_frozen = previous_mask.total() - cv::countNonZero(previous_mask);
+				adaptive_refinement_mask_host = PropagateFrozenMask(previous_mask, adaptive_refinement_mask_host.size());
+				const int inherited_frozen = adaptive_refinement_mask_host.total() -
+					cv::countNonZero(adaptive_refinement_mask_host);
+				std::cout << "Adaptive freeze propagation: " << previous_mask.cols << "x" << previous_mask.rows
+					<< " (" << previous_frozen << " frozen) -> " << adaptive_refinement_mask_host.cols << "x"
+					<< adaptive_refinement_mask_host.rows << " (" << inherited_frozen
+					<< " frozen; every child inherits its parent state)\n";
+			} else {
+				adaptive_refinement_mask_host = previous_mask;
+			}
+		}
+	}
+	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT &&
+		exists(adaptive_stability_path)) {
+		cv::Mat previous_stability_count;
+		if (ReadBinMat(adaptive_stability_path, previous_stability_count) &&
+			previous_stability_count.type() == CV_8UC1) {
+			if (previous_stability_count.size() != adaptive_stability_count_host.size())
+				cv::resize(previous_stability_count, previous_stability_count,
+					adaptive_stability_count_host.size(), 0, 0, cv::INTER_NEAREST);
+			adaptive_stability_count_host = previous_stability_count;
+		}
+	}
+	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT) {
 		cv::Mat current_depth(height, width, CV_32FC1);
 		cv::Mat current_normal(height, width, CV_32FC3);
 		for (int r = 0; r < height; ++r) {
@@ -1181,21 +1245,55 @@ void DPE::SupportInitialization() {
 		}
 		int frozen = 0;
 		const int total = width * height;
+		int min_agreements = 8;
+		float max_normal_angle_degrees = 15.0f;
+		float max_relative_depth_error = 0.0125f;
+		bool require_strong_center = true;
+		if (problem.params.adaptive_refinement_aggressiveness >= 2) {
+			min_agreements = 6;
+			max_normal_angle_degrees = 25.0f;
+			max_relative_depth_error = 0.03f;
+		}
+		if (problem.params.adaptive_refinement_aggressiveness >= 3) {
+			min_agreements = 5;
+			max_normal_angle_degrees = 35.0f;
+			max_relative_depth_error = 0.05f;
+		}
 		for (int r = 1; r + 1 < height; ++r) {
 			uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
+			uchar *stability_row = adaptive_stability_count_host.ptr<uchar>(r);
 			const uchar *weak_row = weak_info_host.ptr<uchar>(r);
 			for (int c = 1; c + 1 < width; ++c) {
-				if (weak_row[c] != STRONG) continue;
+				if (mask_row[c] == 0) continue;
+				if (require_strong_center && weak_row[c] != STRONG) {
+					stability_row[c] = 0;
+					continue;
+				}
 				const float4 &plane = plane_hypotheses_host[r * width + c];
-				if (plane.w < params_host.depth_min || plane.w > params_host.depth_max) continue;
-				if (!IsStablePlanarNeighbourhood(current_depth, current_normal, cv::Mat(), cameras[0], r, c)) continue;
+				const bool stable = plane.w >= params_host.depth_min && plane.w <= params_host.depth_max &&
+					IsStablePlanarNeighbourhood(current_depth, current_normal, cv::Mat(), cameras[0], r, c,
+						min_agreements, max_normal_angle_degrees, max_relative_depth_error);
+				if (!stable) {
+					stability_row[c] = 0;
+					continue;
+				}
+				if (stability_row[c] < 2) ++stability_row[c];
+				if (stability_row[c] < 2) continue;
 				mask_row[c] = 0;
-				++frozen;
 			}
 		}
-		std::cout << "Adaptive refinement mask: " << frozen << " / " << total
+		frozen = total - cv::countNonZero(adaptive_refinement_mask_host);
+		std::cout << "Adaptive refinement mask (aggressiveness "
+			<< problem.params.adaptive_refinement_aggressiveness << "): " << frozen << " / " << total
 			<< " pixels frozen (" << (100.0 * frozen / std::max(1, total)) << "%)" << std::endl;
 	}
+	if (problem.params.adaptive_refinement) {
+		WriteBinMat(adaptive_mask_path, adaptive_refinement_mask_host);
+		WriteBinMat(adaptive_stability_path, adaptive_stability_count_host);
+	}
+	if (problem.params.adaptive_refinement)
+		adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
+			static_cast<float>(std::max(1, width * height));
 }
 
 void DPE::SetDataPassHelperInCuda() {
@@ -1251,6 +1349,10 @@ cv::Mat DPE::GetPixelStates() {
 
 cv::Mat DPE::GetSelectedViews() {
 	return selected_views_host;
+}
+
+float DPE::GetAdaptiveFrozenFraction() const {
+	return adaptive_frozen_fraction;
 }
 
 int DPE::GetWidth() {

@@ -150,7 +150,7 @@ int ComputeRoundNum(const std::vector<Problem> &problems) {
 }
 
 
-void ProcessProblem(const Problem &problem) {
+float ProcessProblem(const Problem &problem) {
 	std::cout << "Processing image: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << "..." << std::endl;
     std::cout << "iteration: " << problem.iteration << std::endl;
 	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -211,6 +211,7 @@ void ProcessProblem(const Problem &problem) {
 	std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 	std::cout << "Processing image: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << " done!" << std::endl;
 	std::cout << "Cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
+	return DPE.GetAdaptiveFrozenFraction();
 }
 
 bool ValidateFusionInputs(const std::vector<Problem> &problems) {
@@ -232,6 +233,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
                      "[--geometric-anchor-cost] [--adaptive-refinement] "
+					 "[--adaptive-refinement-aggressiveness 1|2|3] "
+					 "[--adaptive-refinement-early-stop FRACTION] "
                      "[--adaptive-point-sampling] [--simple-region-stride N] "
                      "[--start-round N] "
                      "[--max-image-size N]\n";
@@ -242,6 +245,8 @@ int main(int argc, char **argv) {
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
     bool adaptive_refinement = false;
+    int adaptive_refinement_aggressiveness = 1;
+    float adaptive_refinement_early_stop = 0.0f;
     bool adaptive_point_sampling = false;
     int simple_region_stride = 2;
     int start_round = 0;
@@ -255,6 +260,22 @@ int main(int argc, char **argv) {
             if (option == "--fuse") fuse_only = true;
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
             else if (option == "--adaptive-refinement") adaptive_refinement = true;
+            else if (option == "--adaptive-refinement-aggressiveness" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                adaptive_refinement_aggressiveness = std::stoi(value, &end);
+                if (end != value.size() || adaptive_refinement_aggressiveness < 1 ||
+                    adaptive_refinement_aggressiveness > 3)
+                    throw std::invalid_argument("adaptive-refinement-aggressiveness must be 1, 2, or 3");
+            }
+            else if (option == "--adaptive-refinement-early-stop" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                adaptive_refinement_early_stop = std::stof(value, &end);
+                if (end != value.size() || !(adaptive_refinement_early_stop >= 0.0f &&
+                    adaptive_refinement_early_stop <= 1.0f))
+                    throw std::invalid_argument("adaptive-refinement-early-stop must be between 0 and 1");
+            }
             else if (option == "--adaptive-point-sampling") adaptive_point_sampling = true;
             else if (option == "--simple-region-stride" && arg < argc) {
                 const std::string value(argv[arg++]);
@@ -277,6 +298,8 @@ int main(int argc, char **argv) {
                 if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
+        if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
+            throw std::invalid_argument("adaptive-refinement-early-stop requires --adaptive-refinement");
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
@@ -290,10 +313,13 @@ int main(int argc, char **argv) {
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
         problem.params.adaptive_refinement = adaptive_refinement;
+        problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
-	std::cout << "Adaptive refinement: " << adaptive_refinement << std::endl;
+	std::cout << "Adaptive refinement: " << adaptive_refinement << " (aggressiveness "
+		<< adaptive_refinement_aggressiveness << ", early-stop threshold "
+		<< adaptive_refinement_early_stop << ")" << std::endl;
 	std::cout << "Adaptive point sampling: " << adaptive_point_sampling
 	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
 	if (!CheckImages(problems)) {
@@ -332,11 +358,13 @@ int main(int argc, char **argv) {
 
 	std::cout << "Round nums: " << round_num << std::endl;
 	int iteration_index = start_round * 4;
+	std::vector<bool> early_stopped(problems.size(), false);
 	if (start_round > 0) {
 		std::cout << "Resuming from pyramid round " << start_round
 			<< " using the saved preceding-scale depth maps." << std::endl;
 	}
 	for (int i = start_round; i < round_num; ++i) {
+		std::fill(early_stopped.begin(), early_stopped.end(), false);
 		for (auto &problem : problems) {
 			problem.iteration = iteration_index;
 			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
@@ -358,11 +386,23 @@ int main(int argc, char **argv) {
 				params.max_iterations = 3;
 				params.weak_peak_radius = 6;
 			}
-			ProcessProblem(problem);
+			const float frozen_fraction = ProcessProblem(problem);
+			if (adaptive_refinement_early_stop > 0.0f &&
+				frozen_fraction >= adaptive_refinement_early_stop) {
+				early_stopped[problem.index] = true;
+				std::cout << "Adaptive early stop: image " << ToFormatIndex(problem.ref_image_id)
+					<< " has " << (100.0f * frozen_fraction) << "% frozen at scale "
+					<< problem.scale_size << "; skipping remaining iterations at this scale.\n";
+			}
 		}
 		iteration_index++;
 		for (int j = 0; j < 3; ++j) {
 			for (auto &problem : problems) {
+				if (early_stopped[problem.index]) {
+					std::cout << "Adaptive early stop: skip image " << ToFormatIndex(problem.ref_image_id)
+						<< " at iteration " << iteration_index << ".\n";
+					continue;
+				}
 				problem.iteration = iteration_index;
 				problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 				problem.params.scale_size = problem.scale_size;
@@ -382,7 +422,14 @@ int main(int argc, char **argv) {
 					params.max_iterations = 3;
 					params.weak_peak_radius = MAX(4 - 2 * j, 2);
 				}
-				ProcessProblem(problem);
+				const float frozen_fraction = ProcessProblem(problem);
+				if (adaptive_refinement_early_stop > 0.0f &&
+					frozen_fraction >= adaptive_refinement_early_stop) {
+					early_stopped[problem.index] = true;
+					std::cout << "Adaptive early stop: image " << ToFormatIndex(problem.ref_image_id)
+						<< " has " << (100.0f * frozen_fraction) << "% frozen at scale "
+						<< problem.scale_size << "; skipping remaining iterations at this scale.\n";
+				}
 			}
 			iteration_index++;
 		}
