@@ -84,6 +84,8 @@ struct DataPassHelper {
 	float *complex_cuda;
 	int *radius_cuda;
 	uchar *adaptive_refinement_mask_cuda;
+	int *active_pixel_indices_cuda;
+	int active_pixel_count;
 #ifdef DEBUG_COST_LINE
 	float *weak_ncc_cost_cuda;
 #endif // DEBUG_COST_LINE
@@ -165,6 +167,8 @@ private:
 	short2 *edge_neigh_cuda;
 	int *radius_cuda;
 	uchar *adaptive_refinement_mask_cuda = nullptr;
+	int *active_pixel_indices_cuda = nullptr;
+	int active_pixel_count = 0;
 	// =========================
 	cv::Mat label_host;
 	int *label_cuda;

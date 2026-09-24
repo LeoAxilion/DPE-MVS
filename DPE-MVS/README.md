@@ -73,6 +73,13 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   remain available as anchors for active neighbours, and nearest-strong
   lookup is retained where an active pixel may read it. The weak/strong
   confidence state is still refreshed for fusion.
+  Once pixels are frozen, anchor-neighbour preparation, fitted-plane generation,
+  and `LocalRefine` launch from a compact list of active pixels instead of
+  assigning one CUDA thread to every image pixel. Checkerboard propagation
+  retains its red/black launches; nearest-strong lookup and confidence refresh
+  still cover the image because active pixels and fusion may need those values.
+  Building the active list has a cost, so the speedup depends on how many
+  pixels freeze and how much time these kernels occupy.
   `--adaptive-refinement-early-stop 0.85` optionally stops the remaining
   outer passes for one reference image at the current scale once at least 85%
   of its pixels are frozen. Active pixels then receive fewer updates, so this

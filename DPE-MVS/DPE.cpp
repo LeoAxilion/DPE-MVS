@@ -849,6 +849,7 @@ DPE::~DPE() {
 	cudaFree(view_weight_cuda);
 	cudaFree(weak_nearest_strong);
 	cudaFree(adaptive_refinement_mask_cuda);
+	cudaFree(active_pixel_indices_cuda);
 #ifdef DEBUG_COST_LINE
 	cudaFree(weak_ncc_cost_cuda);
 #endif // DEBUG_COST_LINE
@@ -1147,6 +1148,21 @@ void DPE::CudaSpaceInitialization() {
 		cudaMalloc((void**)(&adaptive_refinement_mask_cuda), length * sizeof(uchar));
 		cudaMemcpy(adaptive_refinement_mask_cuda, adaptive_refinement_mask_host.ptr<uchar>(0),
 			length * sizeof(uchar), cudaMemcpyHostToDevice);
+		if (adaptive_frozen_fraction > 0.0f) {
+			std::vector<int> active_pixels;
+			active_pixels.reserve(static_cast<size_t>(length * (1.0f - adaptive_frozen_fraction)));
+			for (int r = 0; r < height; ++r) {
+				const uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
+				for (int c = 0; c < width; ++c)
+					if (mask_row[c] != 0) active_pixels.push_back(r * width + c);
+			}
+			active_pixel_count = static_cast<int>(active_pixels.size());
+			if (active_pixel_count > 0) {
+				cudaMalloc((void**)(&active_pixel_indices_cuda), active_pixel_count * sizeof(int));
+				cudaMemcpy(active_pixel_indices_cuda, active_pixels.data(), active_pixel_count * sizeof(int),
+					cudaMemcpyHostToDevice);
+			}
+		}
 	}
 
 	// malloc memory for weak info
@@ -1328,6 +1344,8 @@ void DPE::SetDataPassHelperInCuda() {
 	helper_host.complex_cuda = complex_cuda;
 	helper_host.radius_cuda = radius_cuda;
 	helper_host.adaptive_refinement_mask_cuda = adaptive_refinement_mask_cuda;
+	helper_host.active_pixel_indices_cuda = active_pixel_indices_cuda;
+	helper_host.active_pixel_count = active_pixel_count;
 #ifdef DEBUG_COST_LINE
 	helper_host.weak_ncc_cost_cuda = weak_ncc_cost_cuda;
 #endif // DEBUG_COST_LINE

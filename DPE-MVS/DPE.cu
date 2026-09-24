@@ -2,6 +2,22 @@
 
 #define DEBUG_COMPLEX
 
+// The compact path launches one thread per active pixel. The ordinary path
+// keeps the original two-dimensional full-image launch.
+template <bool Compact>
+__device__ int2 WorkPixel(const DataPassHelper *helper) {
+	if (Compact) {
+		const int work_index = blockIdx.x * (blockDim.x * blockDim.y) +
+			threadIdx.y * blockDim.x + threadIdx.x;
+		if (work_index >= helper->active_pixel_count)
+			return make_int2(helper->width, helper->height);
+		const int center = helper->active_pixel_indices_cuda[work_index];
+		return make_int2(center % helper->width, center / helper->width);
+	}
+	return make_int2(blockIdx.x * blockDim.x + threadIdx.x,
+		blockIdx.y * blockDim.y + threadIdx.y);
+}
+
 __device__  void sort_small(float *d, const int n)
 {
 	int j;
@@ -2142,11 +2158,12 @@ __global__ void RedPixelFilterStrong(DataPassHelper *helper)
 	}
 }
 
+template <bool Compact>
  __global__ void GenNeighbours(DataPassHelper *helper) 
  {
  	int width = helper->width;
  	int height = helper->height;
- 	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
  	if (point.x >= width || point.y >= height) {
  		return;
  	}
@@ -2508,10 +2525,11 @@ __global__ void RedPixelFilterStrong(DataPassHelper *helper)
 	*weak_reliable = 1;
  }
 
+template <bool Compact>
 __global__ void NeigbourUpdate(
 	DataPassHelper *helper
 ) {
-	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
 	const int width = helper->width;
 	const int height = helper->height;
 	if (point.x >= width || point.y >= height) {
@@ -2795,8 +2813,9 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 
 }
 
+template <bool Compact>
 __global__ void LocalRefine(DataPassHelper *helper) {
-	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
 	const int width = helper->width;
 	const int height = helper->height;
 	if (point.x >= width || point.y >= height) {
@@ -2938,8 +2957,9 @@ __global__ void FindNearestStrongPoint(DataPassHelper *helper) {
 	}
 }
 
+template <bool Compact>
 __global__ void RANSACToGetFitPlane(DataPassHelper *helper) {
-	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
 	const int width = helper->width;
 	const int height = helper->height;
 	if (point.x >= width || point.y >= height) {
@@ -3191,6 +3211,11 @@ void DPE::RunPatchMatch() {
 	block_size_full.x = 16;
 	block_size_full.y = 16;
 	block_size_full.z = 1;
+	const bool use_active_worklist = active_pixel_indices_cuda != nullptr;
+	dim3 grid_size_active((active_pixel_count + 255) / 256, 1, 1);
+	if (use_active_worklist)
+		std::cout << "Active-pixel worklist: " << active_pixel_count << " / "
+			<< width * height << " pixels\n";
 
 	dim3 grid_size_half;
 	grid_size_half.x = (width + BLOCK_W - 1) / BLOCK_W;
@@ -3219,10 +3244,16 @@ void DPE::RunPatchMatch() {
 	FindNearestStrongPoint << <grid_size_full, block_size_full >> >(helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	GenNeighbours << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_active_worklist)
+		GenNeighbours<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	else
+		GenNeighbours<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	NeigbourUpdate << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_active_worklist)
+		NeigbourUpdate<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	else
+		NeigbourUpdate<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	
 	if (problem.show_medium_result) { // write neighbour for visualization
@@ -3255,7 +3286,10 @@ void DPE::RunPatchMatch() {
 		RedPixelUpdateStrong << <grid_size_half, block_size_half >> > (i, helper_cuda);
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Iteration " << i << " strong done\n";
-		RANSACToGetFitPlane << <grid_size_full, block_size_full >> > (helper_cuda);
+		if (use_active_worklist)
+			RANSACToGetFitPlane<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+		else
+			RANSACToGetFitPlane<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Compute normal done\n";
 		BlackPixelUpdateWeak << <grid_size_half, block_size_half >> > (i, helper_cuda);
@@ -3276,7 +3310,10 @@ void DPE::RunPatchMatch() {
 	DepthToWeak << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	LocalRefine << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_active_worklist)
+		LocalRefine<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	else
+		LocalRefine<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 #ifdef DEBUG_COST_LINE
 	{
