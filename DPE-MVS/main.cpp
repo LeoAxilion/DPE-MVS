@@ -3,7 +3,8 @@
 
 using namespace boost::filesystem;
 
-void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems)
+void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems,
+	bool show_medium_result)
 {
 	path cluster_list_path = dense_folder / path("pair.txt");
 	problems.clear();
@@ -19,6 +20,7 @@ void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems
 
 	for (int i = 0; i < num_images; ++i) {
 		Problem problem;
+		problem.show_medium_result = show_medium_result;
 		problem.index = i;
 		problem.src_image_ids.clear();
 		iss.clear();
@@ -230,20 +232,29 @@ bool ValidateFusionInputs(const std::vector<Problem> &problems) {
 }
 
 int main(int argc, char **argv) {
+    const auto program_start = std::chrono::steady_clock::now();
+    const auto print_total_elapsed = [&]() {
+        const std::chrono::duration<double> elapsed =
+            std::chrono::steady_clock::now() - program_start;
+        std::cout << "Total elapsed time: " << elapsed.count() << " s\n";
+    };
     if (argc < 2) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
-                     "[--geometric-anchor-cost] [--adaptive-refinement] "
+                     "[--geometric-anchor-cost] "
+					 "[--max-image-size N] "
+                     "[--show-medium-result] "
+                     "[--adaptive-refinement] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
                      "[--adaptive-point-sampling] [--simple-region-stride N] "
-                     "[--start-round N] "
-                     "[--max-image-size N]\n";
+                     "[--start-round N]\n";
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
     int gpu_index = 0, max_image_size = 3200;
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
+    bool show_medium_result = false;
     bool adaptive_refinement = false;
     int adaptive_refinement_aggressiveness = 1;
     float adaptive_refinement_early_stop = 0.0f;
@@ -259,6 +270,7 @@ int main(int argc, char **argv) {
             const std::string option(argv[arg++]);
             if (option == "--fuse") fuse_only = true;
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
+            else if (option == "--show-medium-result") show_medium_result = true;
             else if (option == "--adaptive-refinement") adaptive_refinement = true;
             else if (option == "--adaptive-refinement-aggressiveness" && arg < argc) {
                 const std::string value(argv[arg++]);
@@ -309,7 +321,7 @@ int main(int argc, char **argv) {
     std::cout << "Maximum image size: " << max_image_size << " (0 = original)" << std::endl;
 	// generate problems
 	std::vector<Problem> problems;
-	GenerateSampleList(dense_folder, problems);
+	GenerateSampleList(dense_folder, problems, show_medium_result);
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
         problem.params.adaptive_refinement = adaptive_refinement;
@@ -336,6 +348,7 @@ int main(int argc, char **argv) {
 		}
 		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
+		print_total_elapsed();
 		return EXIT_SUCCESS;
 	}
 
@@ -456,5 +469,6 @@ int main(int argc, char **argv) {
 		}
 	}
 	std::cout << "All done\n";
+	print_total_elapsed();
 	return EXIT_SUCCESS;
 }
