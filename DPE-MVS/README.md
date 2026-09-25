@@ -57,7 +57,7 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   after a local 3x3 depth/normal neighbourhood agrees with one plane. The
   decision starts after the coarsest scale has produced its first depth map;
   a pixel must pass the plane test in two consecutive refinement checks before
-  it freezes. Frozen pixels are carried into later iterations and are
+  it freezes. Frozen pixels remain frozen in later iterations and are
   propagated to finer scales by mapping every child to its parent; if dimensions
   are rounded, the child freezes whenever its source footprint overlaps a frozen
   parent. Its optional
@@ -73,13 +73,8 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   remain available as anchors for active neighbours, and nearest-strong
   lookup is retained where an active pixel may read it. The weak/strong
   confidence state is still refreshed for fusion.
-  If a frozen pixel is classified as `WEAK` or `UNKNOWN` after confidence
-  refresh, it becomes active again in the next outer pass (or pyramid level).
   Frozen pixels use equal weights over their previously selected views for
   this confidence check, since they do not regenerate propagation view weights.
-  Its stability counter is reset, so it must pass two new stability checks
-  before it can freeze again. The current pass has already finished its
-  propagation and local refinement when this reactivation occurs.
   Once pixels are frozen, anchor-neighbour preparation, fitted-plane generation,
   and `LocalRefine` launch from a compact list of active pixels instead of
   assigning one CUDA thread to every image pixel. Checkerboard propagation
