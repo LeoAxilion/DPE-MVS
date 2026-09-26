@@ -26,9 +26,13 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
 ## Usage
 - Compile
 >
-    mkdir build & cd build
-    cmake ..
-    make
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j4
+
+  Single-configuration builds default to `Release` if no build type is set.
+  An explicitly selected `Debug` or other build type is respected. To print
+  per-image CPU and synchronized PatchMatch stage wall times, run with
+  `DPE_PROFILE=1 ./build/DPE ...`; profiling is disabled by default.
 
 - Test
 >
@@ -44,6 +48,20 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   `normals.dmb`, and `weak.bin` in every `$data_folder/DPE/########/` directory.
   Fusion-only runs preserve these intermediate files so that fusion can be retried.
 
+  Experimental plane-range fusion can be selected with:
+>
+    ./DPE $data_folder 0 --fuse --plane-fusion --plane-sample-stride 4
+
+  It groups 4-connected, geometrically compatible pixels into plane patches,
+  validates each patch against a few representative locations in neighboring
+  views, then emits a regular grid of samples within accepted patch ranges.
+  Samples keep their PatchMatch depth; non-planar, small, and unsupported areas
+  use the original per-pixel fusion path. `--plane-sample-stride` controls the
+  grid spacing in image pixels (larger values emit fewer points). This mode is
+  experimental: on the meadow baseline it preserved ETH3D scores closely but
+  reduced total fusion time by only about 1% across two runs, so it did not
+  provide a substantial speedup. See [PLANE_FUSION_MEADOW_REPORT.md](PLANE_FUSION_MEADOW_REPORT.md).
+
   A normal depth-estimation run also preserves these three files after fusion;
   they are persistent fusion inputs and are independent of
   `PatchMatchParams::geometric_anchor_cost` and intermediate-visualization output.
@@ -54,20 +72,22 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
       --adaptive-point-sampling --simple-region-stride 2
 
   `--adaptive-refinement` keeps the depth maps dense but stops updating pixels
-  after a local 3x3 depth/normal neighbourhood agrees with one plane. The
-  decision starts after the coarsest scale has produced its first depth map;
-  a pixel must pass the plane test in two consecutive refinement checks before
-  it freezes. Frozen pixels remain frozen in later iterations and are
-  propagated to finer scales by mapping every child to its parent; if dimensions
-  are rounded, the child freezes whenever its source footprint overlaps a frozen
-  parent. Its optional
-  `--adaptive-refinement-aggressiveness 1|2|3` setting
-  selects conservative (8/8 neighbours, 15 degrees, 1.25% depth error, strong
-  center only), balanced (6/8, 25 degrees, 3%, strong center only), or
-  aggressive (5/8, 35 degrees, 5%, still requiring a strong center) consensus.
-  Invalid depth and the image border remain active. The aggressive setting can
-  freeze incorrect but locally smooth geometry, so compare depth maps and the
-  final mesh against a conservative run before production use.
+  whose completed PatchMatch confidence state is `STRONG`, or whose `WEAK`
+  state has a post-anchor PatchMatch cost at most `0.15`. The confidence state
+  is read after `DepthToWeak`, and the cost is read after anchor propagation
+  and local refinement, so the initial random-plane
+  setup is never used as a freeze decision. A qualifying pixel freezes
+  immediately, and frozen pixels remain frozen in later iterations and are
+  propagated to finer scales by freezing one representative pixel per frozen
+  parent. The other pixels created by upsampling remain active with fresh
+  state to recover fine detail, even when their parent was frozen.
+  State is retained in memory between passes and checkpointed after each pyramid
+  level, including images stopped early. `--start-round` reloads these completed
+  level checkpoints. Neighbour generation, neighbour updating, RANSAC plane
+  fitting, and local refinement use the active-pixel list once at least 25% of
+  the pixels are frozen; below that threshold they use the full image grid.
+  The legacy `--adaptive-refinement-aggressiveness` option is retained for
+  command-line compatibility but no longer changes the freeze decision.
   The frozen mask stops depth/normal refinement and skips building an anchor
   list or fitting a plane for the frozen pixel itself. Frozen strong pixels
   remain available as anchors for active neighbours, and nearest-strong

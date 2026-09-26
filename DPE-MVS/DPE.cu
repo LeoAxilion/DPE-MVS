@@ -1,4 +1,5 @@
 #include "DPE.h"
+#include <cstdlib>
 
 #define DEBUG_COMPLEX
 
@@ -2783,7 +2784,6 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 			}
 		}
 	}
-
 	if (abs(min_peak - radius) > helper->params->weak_peak_radius || p_costs[min_peak] > 0.5f) {
 		helper->weak_info_cuda[center] = WEAK;
 		return;
@@ -3204,6 +3204,15 @@ __global__ void RANSACToGetFitPlane(DataPassHelper *helper) {
 
 void DPE::RunPatchMatch() {
 	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
+	auto profile_start = start;
+	const auto profile_stage = [&](const char *name) {
+		if (!profile) return;
+		const auto now = std::chrono::steady_clock::now();
+		std::cout << "Profile GPU " << name << ": "
+			<< std::chrono::duration<double, std::milli>(now - profile_start).count() << " ms\n";
+		profile_start = now;
+	};
 
 	int BLOCK_W = 32;
 	int BLOCK_H = (BLOCK_W / 2);
@@ -3216,7 +3225,8 @@ void DPE::RunPatchMatch() {
 	block_size_full.x = 16;
 	block_size_full.y = 16;
 	block_size_full.z = 1;
-	const bool use_active_worklist = active_pixel_indices_cuda != nullptr;
+	const bool use_active_worklist = params_host.adaptive_refinement &&
+		active_pixel_count < width * height;
 	dim3 grid_size_active((active_pixel_count + 255) / 256, 1, 1);
 	if (use_active_worklist)
 		std::cout << "Active-pixel worklist: " << active_pixel_count << " / "
@@ -3248,16 +3258,19 @@ void DPE::RunPatchMatch() {
 
 	FindNearestStrongPoint << <grid_size_full, block_size_full >> >(helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
+	profile_stage("preparation");
 
-	if (use_active_worklist)
-		GenNeighbours<true> << <grid_size_active, block_size_full >> > (helper_cuda);
-	else
+	if (use_active_worklist) {
+		if (active_pixel_count > 0)
+			GenNeighbours<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else
 		GenNeighbours<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	if (use_active_worklist)
-		NeigbourUpdate<true> << <grid_size_active, block_size_full >> > (helper_cuda);
-	else
+	if (use_active_worklist) {
+		if (active_pixel_count > 0)
+			NeigbourUpdate<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else
 		NeigbourUpdate<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	
@@ -3282,8 +3295,10 @@ void DPE::RunPatchMatch() {
 
 	std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 	std::cout << "Generate neighbours done. Cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
+	profile_stage("neighbours");
 	RandomInitialization << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
+	profile_stage("initialization");
 
 	for (int i = 0; i < params_host.max_iterations; ++i) {
 		BlackPixelUpdateStrong << <grid_size_half, block_size_half >> > (i, helper_cuda);
@@ -3291,17 +3306,21 @@ void DPE::RunPatchMatch() {
 		RedPixelUpdateStrong << <grid_size_half, block_size_half >> > (i, helper_cuda);
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Iteration " << i << " strong done\n";
-		if (use_active_worklist)
-			RANSACToGetFitPlane<true> << <grid_size_active, block_size_full >> > (helper_cuda);
-		else
+		profile_stage("strong propagation");
+		if (use_active_worklist) {
+			if (active_pixel_count > 0)
+				RANSACToGetFitPlane<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+		} else
 			RANSACToGetFitPlane<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Compute normal done\n";
+		profile_stage("plane fitting");
 		BlackPixelUpdateWeak << <grid_size_half, block_size_half >> > (i, helper_cuda);
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		RedPixelUpdateWeak << <grid_size_half, block_size_half >> > (i, helper_cuda);
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Iteration " << i << " -weak- done\n";
+		profile_stage("weak propagation");
 	}
 	
 	GetDepthandNormal << <grid_size_full, block_size_full >> > (helper_cuda);
@@ -3311,15 +3330,27 @@ void DPE::RunPatchMatch() {
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	RedPixelFilterStrong << <grid_size_half, block_size_half >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
+	profile_stage("filtering");
 
 	DepthToWeak << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
+	profile_stage("confidence");
 
-	if (use_active_worklist)
-		LocalRefine<true> << <grid_size_active, block_size_full >> > (helper_cuda);
-	else
+	if (use_active_worklist) {
+		if (active_pixel_count > 0)
+			LocalRefine<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else
 		LocalRefine<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
+	if (params_host.adaptive_refinement) {
+		// costs_cuda is updated by weak checkerboard propagation after candidate
+		// anchor planes have been evaluated. Use that post-anchor PatchMatch cost
+		// for the optional low-cost WEAK freeze decision.
+		confidence_cost_host.create(height, width, CV_32FC1);
+		cudaMemcpy(confidence_cost_host.ptr<float>(0), costs_cuda,
+			width * height * sizeof(float), cudaMemcpyDeviceToHost);
+	}
+	profile_stage("local refinement");
 #ifdef DEBUG_COST_LINE
 	{
 		// export for test

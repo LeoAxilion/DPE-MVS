@@ -112,6 +112,11 @@ struct PatchMatchParams {
 	RunState state;
 };
 
+struct AdaptiveRefinementState {
+	cv::Mat mask;
+	cv::Mat stability;
+};
+
 struct Problem {
 	int index;
 	int ref_image_id;
@@ -122,6 +127,9 @@ struct Problem {
 	PatchMatchParams params;
 	bool show_medium_result;
 	int iteration;
+	// Shared by successive DPE instances for this image; checkpointed per scale.
+	std::shared_ptr<AdaptiveRefinementState> adaptive_state =
+		std::make_shared<AdaptiveRefinementState>();
 };
 
 // Shared sizing rule for image, intrinsics and edge pyramids; never upscale.

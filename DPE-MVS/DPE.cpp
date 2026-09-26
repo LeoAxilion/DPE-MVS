@@ -1,6 +1,7 @@
 #include "DPE.h"
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 
 #define _JACOBI_ROTATE(a, i, j, k, l) \
@@ -23,12 +24,31 @@ bool IsValidNormal(const cv::Vec3f &normal) {
 	return IsFiniteFloat(length_squared) && length_squared > 1e-12f;
 }
 
-// Transfer a frozen state between pyramid levels conservatively. On upsampling,
-// every child pixel maps to its parent; on downsampling, a target stays frozen
-// if any source pixel in its footprint was frozen.
+// Preserve one representative of each frozen pixel at finer pyramid levels.
+// Newly created pixels stay active so they can resolve finer-scale details.
+// On downsampling, retain the conservative footprint behavior.
+int RepresentativeCoordinate(int source_coordinate, int source_length, int target_length) {
+	return static_cast<int>(((2LL * source_coordinate + 1) * target_length) /
+		(2LL * source_length));
+}
+
 cv::Mat PropagateFrozenMask(const cv::Mat &source, const cv::Size &target_size) {
 	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
 	cv::Mat target(target_size, CV_8UC1, cv::Scalar(1));
+	if (target.cols >= source.cols && target.rows >= source.rows) {
+		for (int y = 0; y < source.rows; ++y) {
+			const uchar *source_row = source.ptr<uchar>(y);
+			const int target_y = RepresentativeCoordinate(y, source.rows, target.rows);
+			uchar *target_row = target.ptr<uchar>(target_y);
+			for (int x = 0; x < source.cols; ++x) {
+				if (source_row[x] == 0) {
+					const int target_x = RepresentativeCoordinate(x, source.cols, target.cols);
+					target_row[target_x] = 0;
+				}
+			}
+		}
+		return target;
+	}
 	for (int y = 0; y < target.rows; ++y) {
 		const int source_y_begin = y * source.rows / target.rows;
 		const int source_y_end = std::min(source.rows,
@@ -49,6 +69,24 @@ cv::Mat PropagateFrozenMask(const cv::Mat &source, const cv::Size &target_size) 
 			}
 			if (frozen) target.at<uchar>(y, x) = 0;
 		}
+	}
+	return target;
+}
+
+// Stability belongs to the tested pixel, not to every pixel interpolated from it.
+cv::Mat PropagateStabilityCount(const cv::Mat &source, const cv::Size &target_size) {
+	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
+	if (target_size.width < source.cols || target_size.height < source.rows) {
+		cv::Mat target;
+		cv::resize(source, target, target_size, 0, 0, cv::INTER_NEAREST);
+		return target;
+	}
+	cv::Mat target(target_size, CV_8UC1, cv::Scalar(0));
+	for (int y = 0; y < source.rows; ++y) {
+		const uchar *source_row = source.ptr<uchar>(y);
+		uchar *target_row = target.ptr<uchar>(RepresentativeCoordinate(y, source.rows, target.rows));
+		for (int x = 0; x < source.cols; ++x)
+			target_row[RepresentativeCoordinate(x, source.cols, target.cols)] = source_row[x];
 	}
 	return target;
 }
@@ -1148,7 +1186,9 @@ void DPE::CudaSpaceInitialization() {
 		cudaMalloc((void**)(&adaptive_refinement_mask_cuda), length * sizeof(uchar));
 		cudaMemcpy(adaptive_refinement_mask_cuda, adaptive_refinement_mask_host.ptr<uchar>(0),
 			length * sizeof(uchar), cudaMemcpyHostToDevice);
-		if (adaptive_frozen_fraction > 0.0f) {
+		active_pixel_count = length;
+		if (adaptive_frozen_fraction >= 0.25f &&
+			cv::countNonZero(adaptive_refinement_mask_host) < length) {
 			std::vector<int> active_pixels;
 			active_pixels.reserve(static_cast<size_t>(length * (1.0f - adaptive_frozen_fraction)));
 			for (int r = 0; r < height; ++r) {
@@ -1214,14 +1254,27 @@ void DPE::SupportInitialization() {
 		ReadBinMat(label_path, label_host);
 	}
 
+	if (!problem.params.adaptive_refinement) return;
+	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
+	auto profile_start = std::chrono::steady_clock::now();
+	const auto profile_stage = [&](const char *name) {
+		if (!profile) return;
+		const auto now = std::chrono::steady_clock::now();
+		std::cout << "Profile freeze " << name << ": "
+			<< std::chrono::duration<double, std::milli>(now - profile_start).count() << " ms\n";
+		profile_start = now;
+	};
 	adaptive_refinement_mask_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(1));
 	cv::Mat adaptive_stability_count_host = cv::Mat::zeros(height, width, CV_8UC1);
 	const path adaptive_mask_path = problem.result_folder / path("adaptive_frozen.dmb");
 	const path adaptive_stability_path = problem.result_folder / path("adaptive_stability.dmb");
-	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT &&
-		exists(adaptive_mask_path)) {
-		cv::Mat previous_mask;
-		if (ReadBinMat(adaptive_mask_path, previous_mask) && previous_mask.type() == CV_8UC1) {
+	auto &adaptive_state = *problem.adaptive_state;
+	if (problem.params.state == FIRST_INIT) adaptive_state = AdaptiveRefinementState();
+	if (problem.params.state != FIRST_INIT) {
+		cv::Mat previous_mask = adaptive_state.mask;
+		if (previous_mask.empty() && exists(adaptive_mask_path))
+			ReadBinMat(adaptive_mask_path, previous_mask);
+		if (!previous_mask.empty() && previous_mask.type() == CV_8UC1) {
 			if (previous_mask.size() != adaptive_refinement_mask_host.size()) {
 				const int previous_frozen = previous_mask.total() - cv::countNonZero(previous_mask);
 				adaptive_refinement_mask_host = PropagateFrozenMask(previous_mask, adaptive_refinement_mask_host.size());
@@ -1230,86 +1283,30 @@ void DPE::SupportInitialization() {
 				std::cout << "Adaptive freeze propagation: " << previous_mask.cols << "x" << previous_mask.rows
 					<< " (" << previous_frozen << " frozen) -> " << adaptive_refinement_mask_host.cols << "x"
 					<< adaptive_refinement_mask_host.rows << " (" << inherited_frozen
-					<< " frozen; every child inherits its parent state)\n";
+					<< " frozen; one representative per frozen parent)\n";
 			} else {
 				adaptive_refinement_mask_host = previous_mask;
 			}
 		}
 	}
-	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT &&
-		exists(adaptive_stability_path)) {
-		cv::Mat previous_stability_count;
-		if (ReadBinMat(adaptive_stability_path, previous_stability_count) &&
+	if (problem.params.state != FIRST_INIT) {
+		cv::Mat previous_stability_count = adaptive_state.stability;
+		if (previous_stability_count.empty() && exists(adaptive_stability_path))
+			ReadBinMat(adaptive_stability_path, previous_stability_count);
+		if (!previous_stability_count.empty() &&
 			previous_stability_count.type() == CV_8UC1) {
 			if (previous_stability_count.size() != adaptive_stability_count_host.size())
-				cv::resize(previous_stability_count, previous_stability_count,
-					adaptive_stability_count_host.size(), 0, 0, cv::INTER_NEAREST);
+				previous_stability_count = PropagateStabilityCount(previous_stability_count,
+					adaptive_stability_count_host.size());
 			adaptive_stability_count_host = previous_stability_count;
 		}
 	}
-	if (problem.params.adaptive_refinement && problem.params.state != FIRST_INIT) {
-		cv::Mat current_depth(height, width, CV_32FC1);
-		cv::Mat current_normal(height, width, CV_32FC3);
-		for (int r = 0; r < height; ++r) {
-			float *depth_row = current_depth.ptr<float>(r);
-			cv::Vec3f *normal_row = current_normal.ptr<cv::Vec3f>(r);
-			for (int c = 0; c < width; ++c) {
-				const float4 &plane = plane_hypotheses_host[r * width + c];
-				depth_row[c] = plane.w;
-				normal_row[c] = cv::Vec3f(plane.x, plane.y, plane.z);
-			}
-		}
-		int frozen = 0;
-		const int total = width * height;
-		int min_agreements = 8;
-		float max_normal_angle_degrees = 15.0f;
-		float max_relative_depth_error = 0.0125f;
-		bool require_strong_center = true;
-		if (problem.params.adaptive_refinement_aggressiveness >= 2) {
-			min_agreements = 6;
-			max_normal_angle_degrees = 25.0f;
-			max_relative_depth_error = 0.03f;
-		}
-		if (problem.params.adaptive_refinement_aggressiveness >= 3) {
-			min_agreements = 5;
-			max_normal_angle_degrees = 35.0f;
-			max_relative_depth_error = 0.05f;
-		}
-		for (int r = 1; r + 1 < height; ++r) {
-			uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
-			uchar *stability_row = adaptive_stability_count_host.ptr<uchar>(r);
-			const uchar *weak_row = weak_info_host.ptr<uchar>(r);
-			for (int c = 1; c + 1 < width; ++c) {
-				if (mask_row[c] == 0) continue;
-				if (require_strong_center && weak_row[c] != STRONG) {
-					stability_row[c] = 0;
-					continue;
-				}
-				const float4 &plane = plane_hypotheses_host[r * width + c];
-				const bool stable = plane.w >= params_host.depth_min && plane.w <= params_host.depth_max &&
-					IsStablePlanarNeighbourhood(current_depth, current_normal, cv::Mat(), cameras[0], r, c,
-						min_agreements, max_normal_angle_degrees, max_relative_depth_error);
-				if (!stable) {
-					stability_row[c] = 0;
-					continue;
-				}
-				if (stability_row[c] < 2) ++stability_row[c];
-				if (stability_row[c] < 2) continue;
-				mask_row[c] = 0;
-			}
-		}
-		frozen = total - cv::countNonZero(adaptive_refinement_mask_host);
-		std::cout << "Adaptive refinement mask (aggressiveness "
-			<< problem.params.adaptive_refinement_aggressiveness << "): " << frozen << " / " << total
-			<< " pixels frozen (" << (100.0 * frozen / std::max(1, total)) << "%)" << std::endl;
-	}
-	if (problem.params.adaptive_refinement) {
-		WriteBinMat(adaptive_mask_path, adaptive_refinement_mask_host);
-		WriteBinMat(adaptive_stability_path, adaptive_stability_count_host);
-	}
-	if (problem.params.adaptive_refinement)
-		adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
-			static_cast<float>(std::max(1, width * height));
+	profile_stage("load state");
+	adaptive_state.mask = adaptive_refinement_mask_host;
+	adaptive_state.stability = adaptive_stability_count_host;
+	adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
+		static_cast<float>(std::max(1, width * height));
+	profile_stage("cache state");
 }
 
 void DPE::SetDataPassHelperInCuda() {
@@ -1363,6 +1360,48 @@ cv::Mat DPE::GetEdge() {
 
 cv::Mat DPE::GetPixelStates() {
 	return weak_info_host;
+}
+
+cv::Mat DPE::GetConfidenceCosts() {
+	return confidence_cost_host;
+}
+
+void DPE::UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
+	const cv::Mat &confidence_costs) {
+	if (!problem.params.adaptive_refinement || pixel_states.empty() ||
+		pixel_states.size() != adaptive_refinement_mask_host.size() ||
+		confidence_costs.empty() || confidence_costs.size() != pixel_states.size() ||
+		confidence_costs.type() != CV_32FC1) return;
+	AdaptiveRefinementState &state = *problem.adaptive_state;
+	constexpr float kWeakFreezeCostThreshold = 0.15f;
+	int newly_frozen = 0;
+	int newly_frozen_strong = 0;
+	int newly_frozen_weak_low_cost = 0;
+	for (int r = 0; r < pixel_states.rows; ++r) {
+		const uchar *state_row = pixel_states.ptr<uchar>(r);
+		const float *cost_row = confidence_costs.ptr<float>(r);
+		uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
+		uchar *stability_row = state.stability.ptr<uchar>(r);
+		for (int c = 0; c < pixel_states.cols; ++c) {
+			const bool strong = state_row[c] == STRONG;
+			const bool weak_low_cost = state_row[c] == WEAK &&
+				IsFiniteFloat(cost_row[c]) && cost_row[c] <= kWeakFreezeCostThreshold;
+			if (mask_row[c] != 0 && (strong || weak_low_cost)) {
+				mask_row[c] = 0;
+				stability_row[c] = 1;
+				++newly_frozen;
+				if (strong) ++newly_frozen_strong;
+				else ++newly_frozen_weak_low_cost;
+			}
+		}
+	}
+	state.mask = adaptive_refinement_mask_host;
+	adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
+		static_cast<float>(std::max(1, adaptive_refinement_mask_host.rows * adaptive_refinement_mask_host.cols));
+	std::cout << "Adaptive confidence freeze: " << newly_frozen << " newly frozen ("
+		<< newly_frozen_strong << " strong, " << newly_frozen_weak_low_cost
+		<< " weak cost <= " << kWeakFreezeCostThreshold << "), "
+		<< (100.0f * adaptive_frozen_fraction) << "% total" << std::endl;
 }
 
 cv::Mat DPE::GetSelectedViews() {
@@ -1485,10 +1524,160 @@ float GetAngle(const cv::Vec3f &v1, const cv::Vec3f &v2)
 	return angle;
 }
 
+namespace {
+struct PlanePatch {
+	cv::Vec3f normal;
+	float offset;
+	int min_x;
+	int min_y;
+	int max_x;
+	int max_y;
+	int area;
+	int sample_pixels[5];
+};
+
+struct PlanePatchMap {
+	cv::Mat labels;
+	std::vector<PlanePatch> patches;
+};
+
+cv::Vec3f WorldCameraCenter(const Camera &camera) {
+	return cv::Vec3f(
+		-(camera.R[0] * camera.t[0] + camera.R[3] * camera.t[1] + camera.R[6] * camera.t[2]),
+		-(camera.R[1] * camera.t[0] + camera.R[4] * camera.t[1] + camera.R[7] * camera.t[2]),
+		-(camera.R[2] * camera.t[0] + camera.R[5] * camera.t[1] + camera.R[8] * camera.t[2]));
+}
+
+cv::Vec3f WorldRayDirection(const Camera &camera, int x, int y) {
+	const float ray_x = (x - camera.K[2]) / camera.K[0];
+	const float ray_y = (y - camera.K[5]) / camera.K[4];
+	return cv::Vec3f(
+		camera.R[0] * ray_x + camera.R[3] * ray_y + camera.R[6],
+		camera.R[1] * ray_x + camera.R[4] * ray_y + camera.R[7],
+		camera.R[2] * ray_x + camera.R[5] * ray_y + camera.R[8]);
+}
+
+bool IntersectPlaneAtPixel(const PlanePatch &patch, const Camera &camera,
+		int x, int y, float &depth, cv::Vec3f *world_point = nullptr) {
+	const cv::Vec3f center = WorldCameraCenter(camera);
+	const cv::Vec3f ray = WorldRayDirection(camera, x, y);
+	const float denominator = patch.normal.dot(ray);
+	if (!IsFiniteFloat(denominator) || std::fabs(denominator) < 1e-8f) return false;
+	depth = -(patch.normal.dot(center) + patch.offset) / denominator;
+	if (!IsFiniteFloat(depth) || depth <= 0.0f) return false;
+	if (world_point) *world_point = center + ray * depth;
+	return true;
+}
+
+PlanePatchMap BuildPlanePatchMap(const cv::Mat &depth, const cv::Mat &normal,
+		const Camera &camera) {
+	PlanePatchMap result;
+	result.labels = cv::Mat(depth.size(), CV_32SC1, cv::Scalar(-1));
+	cv::Mat visited(depth.size(), CV_8UC1, cv::Scalar(0));
+	const float normal_cosine = std::cos(8.0f * static_cast<float>(M_PI) / 180.0f);
+	const int dx[4] = {1, -1, 0, 0};
+	const int dy[4] = {0, 0, 1, -1};
+	std::vector<int> region;
+	std::vector<int> stack;
+	region.reserve(1024);
+	stack.reserve(1024);
+	uint64_t planar_pixels = 0;
+
+	for (int y = 0; y < depth.rows; ++y) {
+		for (int x = 0; x < depth.cols; ++x) {
+			if (visited.at<uchar>(y, x)) continue;
+			visited.at<uchar>(y, x) = 1;
+			const float seed_depth = depth.at<float>(y, x);
+			const cv::Vec3f seed_normal_raw = normal.at<cv::Vec3f>(y, x);
+			if (!IsFiniteFloat(seed_depth) || seed_depth <= 0.0f || !IsValidNormal(seed_normal_raw)) continue;
+			const cv::Vec3f seed_normal = seed_normal_raw * (1.0f / std::sqrt(seed_normal_raw.dot(seed_normal_raw)));
+			const float3 seed_world = Get3DPointonWorld(x, y, seed_depth, camera);
+			const cv::Vec3f seed_point(seed_world.x, seed_world.y, seed_world.z);
+			const float seed_offset = -seed_normal.dot(seed_point);
+			region.clear();
+			stack.clear();
+			const int seed_index = y * depth.cols + x;
+			stack.push_back(seed_index);
+			visited.at<uchar>(y, x) = 2;
+			int min_x = x, max_x = x, min_y = y, max_y = y;
+			int min_x_index = seed_index, max_x_index = seed_index;
+			int min_y_index = seed_index, max_y_index = seed_index;
+			cv::Vec3f normal_sum(0, 0, 0), point_sum(0, 0, 0);
+
+			while (!stack.empty()) {
+				const int index = stack.back();
+				stack.pop_back();
+				const int cy = index / depth.cols;
+				const int cx = index - cy * depth.cols;
+				region.push_back(index);
+				if (cx < min_x) { min_x = cx; min_x_index = index; }
+				if (cx > max_x) { max_x = cx; max_x_index = index; }
+				if (cy < min_y) { min_y = cy; min_y_index = index; }
+				if (cy > max_y) { max_y = cy; max_y_index = index; }
+				const cv::Vec3f nraw = normal.at<cv::Vec3f>(cy, cx);
+				const cv::Vec3f n = nraw * (1.0f / std::sqrt(nraw.dot(nraw)));
+				const float z = depth.at<float>(cy, cx);
+				const float3 world3 = Get3DPointonWorld(cx, cy, z, camera);
+				const cv::Vec3f point(world3.x, world3.y, world3.z);
+				normal_sum += n;
+				point_sum += point;
+
+				for (int k = 0; k < 4; ++k) {
+					const int nx = cx + dx[k], ny = cy + dy[k];
+					if (nx < 0 || ny < 0 || nx >= depth.cols || ny >= depth.rows ||
+						visited.at<uchar>(ny, nx)) continue;
+					const float nz = depth.at<float>(ny, nx);
+					const cv::Vec3f nnraw = normal.at<cv::Vec3f>(ny, nx);
+					if (!IsFiniteFloat(nz) || nz <= 0.0f || !IsValidNormal(nnraw)) continue;
+					const cv::Vec3f nn = nnraw * (1.0f / std::sqrt(nnraw.dot(nnraw)));
+					if (std::fabs(seed_normal.dot(nn)) < normal_cosine) continue;
+					const float3 neighbor3 = Get3DPointonWorld(nx, ny, nz, camera);
+					const cv::Vec3f neighbor(neighbor3.x, neighbor3.y, neighbor3.z);
+					const float tolerance = std::max(0.005f, 0.002f * seed_depth);
+					if (std::fabs(seed_normal.dot(neighbor) + seed_offset) > tolerance) continue;
+					visited.at<uchar>(ny, nx) = 2;
+					stack.push_back(ny * depth.cols + nx);
+				}
+			}
+
+			// Very small coplanar groups are cheaper and safer as individual samples.
+			if (region.size() < 16) {
+				for (int index : region) visited.at<uchar>(index / depth.cols, index % depth.cols) = 1;
+				continue;
+			}
+		cv::Vec3f patch_normal = normal_sum * (1.0f / std::sqrt(normal_sum.dot(normal_sum)));
+		const cv::Vec3f centroid = point_sum * (1.0f / static_cast<float>(region.size()));
+		PlanePatch patch;
+		patch.normal = patch_normal;
+		patch.offset = -patch_normal.dot(centroid);
+		patch.min_x = min_x; patch.max_x = max_x;
+		patch.min_y = min_y; patch.max_y = max_y;
+		patch.area = static_cast<int>(region.size());
+		patch.sample_pixels[0] = seed_index;
+		patch.sample_pixels[1] = min_x_index;
+		patch.sample_pixels[2] = max_x_index;
+		patch.sample_pixels[3] = min_y_index;
+		patch.sample_pixels[4] = max_y_index;
+		const int patch_id = static_cast<int>(result.patches.size());
+		result.patches.push_back(patch);
+		for (int index : region)
+			result.labels.at<int>(index / depth.cols, index % depth.cols) = patch_id;
+		planar_pixels += region.size();
+		}
+	}
+	std::cout << "Plane patches: " << result.patches.size() << ", " << planar_pixels
+		<< " pixels in patches / " << (depth.total()) << " total\n";
+	return result;
+}
+
+}
+
 // ETH version
-void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride)
+void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride,
+		bool plane_fusion, int plane_sample_stride)
 {
 	if (simple_region_stride < 1) throw std::invalid_argument("simple_region_stride must be >= 1");
+	if (plane_sample_stride < 1) throw std::invalid_argument("plane_sample_stride must be >= 1");
 	int num_images = problems.size();
 	path image_folder = dense_folder / path("images");
 	path cam_folder = dense_folder / path("cams");
@@ -1543,7 +1732,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	
 		cv::Mat scaled_image;
 		RescaleImageAndCamera(image, scaled_image, depth, camera);
-		if (simple_region_stride > 1 && normal.size() != depth.size())
+		if ((plane_fusion || simple_region_stride > 1) && normal.size() != depth.size())
 			cv::resize(normal, normal, depth.size(), 0, 0, cv::INTER_NEAREST);
 		images.emplace_back(scaled_image);
 		cameras.emplace_back(camera);
@@ -1553,6 +1742,242 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 		masks.emplace_back(mask);
 		RescaleMatToTargetSize<uchar>(weak, weak, cv::Size2i(depth.cols, depth.rows));
 		weaks.emplace_back(weak);
+	}
+	if (plane_fusion) {
+		if (plane_sample_stride < 1)
+			throw std::invalid_argument("plane fusion sample stride must be >= 1");
+		const auto segmentation_start = std::chrono::steady_clock::now();
+		std::vector<PlanePatchMap> patch_maps;
+		patch_maps.reserve(num_images);
+		for (int i = 0; i < num_images; ++i) {
+			std::cout << "Segmenting planes in image " << std::setw(8) << std::setfill('0') << i << "...\n";
+			patch_maps.emplace_back(BuildPlanePatchMap(depths[i], normals[i], cameras[i]));
+		}
+		const auto segmentation_end = std::chrono::steady_clock::now();
+		std::cout << "Plane segmentation time: " << std::chrono::duration<double>(segmentation_end - segmentation_start).count() << " s\n";
+
+		const auto fusion_start = std::chrono::steady_clock::now();
+		std::vector<PointList> plane_point_cloud;
+		uint64_t patch_pixels_skipped = 0;
+		uint64_t fallback_pixels_tested = 0;
+		uint64_t fused_plane_patches = 0;
+		std::vector<std::vector<uchar>> consumed_patches(num_images);
+		for (int i = 0; i < num_images; ++i)
+			consumed_patches[i].assign(patch_maps[i].patches.size(), 0);
+
+		for (int i = 0; i < num_images; ++i) {
+			std::cout << "Plane-fusing image " << std::setw(8) << std::setfill('0') << i << "...\n";
+			const auto &problem = problems[i];
+			const int ref_index = imageIdToindexMap[problem.ref_image_id];
+			const int cols = depths[ref_index].cols;
+			const int rows = depths[ref_index].rows;
+			const int num_ngb = problem.src_image_ids.size();
+			const PlanePatchMap &ref_map = patch_maps[ref_index];
+
+			// Validate a plane range against a few representative locations once;
+			// then emit the requested sample grid without repeating view checks per point.
+			for (int patch_id = 0; patch_id < static_cast<int>(ref_map.patches.size()); ++patch_id) {
+				if (consumed_patches[ref_index][patch_id]) continue;
+				const PlanePatch &ref_patch = ref_map.patches[patch_id];
+				std::vector<int> supporting_images;
+				float support_score_sum = 0.0f;
+				for (int j = 0; j < num_ngb; ++j) {
+					const int src_index = imageIdToindexMap[problem.src_image_ids[j]];
+					int best_patch_id = -1;
+					int best_hits = 0;
+					float best_score = 0.0f;
+					for (int rep = 0; rep < 5; ++rep) {
+						const int ref_pixel = ref_patch.sample_pixels[rep];
+						bool duplicate = false;
+						for (int earlier = 0; earlier < rep; ++earlier)
+							if (ref_patch.sample_pixels[earlier] == ref_pixel) duplicate = true;
+						if (duplicate) continue;
+						const int ref_r = ref_pixel / cols;
+						const int ref_c = ref_pixel % cols;
+					if (use_block && blocks[ref_index].at<uchar>(ref_r, ref_c) < 128) continue;
+					float sample_depth = 0.0f;
+					cv::Vec3f world_point;
+					if (!IntersectPlaneAtPixel(ref_patch, cameras[ref_index], ref_c, ref_r,
+							sample_depth, &world_point)) continue;
+					const float3 sample = make_float3(world_point[0], world_point[1], world_point[2]);
+					float2 projected;
+					float projected_depth;
+					ProjectCamera(sample, cameras[src_index], projected, projected_depth);
+					const int src_c = static_cast<int>(projected.x + 0.5f);
+					const int src_r = static_cast<int>(projected.y + 0.5f);
+					if (src_c < 0 || src_r < 0 || src_c >= depths[src_index].cols || src_r >= depths[src_index].rows ||
+						masks[src_index].at<uchar>(src_r, src_c) == 1) continue;
+					const int src_patch_id = patch_maps[src_index].labels.at<int>(src_r, src_c);
+					if (src_patch_id < 0 || consumed_patches[src_index][src_patch_id]) continue;
+					const PlanePatch &src_patch = patch_maps[src_index].patches[src_patch_id];
+					const float normal_cosine = std::fabs(ref_patch.normal.dot(src_patch.normal));
+					if (!IsFiniteFloat(normal_cosine) || normal_cosine < std::cos(10.0f * static_cast<float>(M_PI) / 180.0f)) continue;
+					const float plane_distance = std::fabs(src_patch.normal.dot(cv::Vec3f(sample.x, sample.y, sample.z)) + src_patch.offset);
+					const float distance_tolerance = std::max(0.005f, 0.002f * projected_depth);
+					if (!IsFiniteFloat(plane_distance) || plane_distance > distance_tolerance) continue;
+					const float score = std::exp(-10.0f * std::acos(std::min(1.0f, normal_cosine)) -
+						0.2f * plane_distance / distance_tolerance);
+					if (src_patch_id == best_patch_id) {
+						++best_hits;
+						best_score += score;
+					} else if (best_patch_id < 0) {
+						best_patch_id = src_patch_id;
+						best_hits = 1;
+						best_score = score;
+					}
+				}
+				if (best_patch_id >= 0 && best_hits >= 2) {
+					supporting_images.push_back(src_index);
+					support_score_sum += best_score / best_hits;
+				}
+			}
+			const int seed_pixel = ref_patch.sample_pixels[0];
+			const int seed_r = seed_pixel / cols, seed_c = seed_pixel % cols;
+			const float support_factor = weaks[ref_index].at<uchar>(seed_r, seed_c) == WEAK ? 0.45f : 0.3f;
+			if (supporting_images.empty() || support_score_sum <= support_factor * supporting_images.size()) continue;
+
+			consumed_patches[ref_index][patch_id] = 1;
+			++fused_plane_patches;
+			bool emitted_patch_sample = false;
+			for (int r = ref_patch.min_y; r <= ref_patch.max_y; ++r) {
+				for (int c = ref_patch.min_x; c <= ref_patch.max_x; ++c) {
+					if (ref_map.labels.at<int>(r, c) != patch_id ||
+						(r % plane_sample_stride != 0 || c % plane_sample_stride != 0)) continue;
+					if (masks[ref_index].at<uchar>(r, c) == 1) continue;
+					if (use_block && blocks[ref_index].at<uchar>(r, c) < 128) continue;
+					const float sample_depth = depths[ref_index].at<float>(r, c);
+					if (!IsFiniteFloat(sample_depth) || sample_depth <= 0.0f) continue;
+					const cv::Vec3f sample_normal = normals[ref_index].at<cv::Vec3f>(r, c);
+					if (!IsValidNormal(sample_normal)) continue;
+					const float3 sample_world = Get3DPointonWorld(c, r, sample_depth, cameras[ref_index]);
+					PointList point3D;
+					point3D.coord = sample_world;
+					point3D.normal = make_float3(sample_normal[0], sample_normal[1], sample_normal[2]);
+					const cv::Vec3b color = images[ref_index].at<cv::Vec3b>(r, c);
+					point3D.color = make_float3(color[0], color[1], color[2]);
+					plane_point_cloud.emplace_back(point3D);
+					for (int src_index : supporting_images) {
+						float2 projected;
+						float projected_depth;
+						ProjectCamera(sample_world, cameras[src_index], projected, projected_depth);
+						const int src_c = static_cast<int>(projected.x + 0.5f);
+						const int src_r = static_cast<int>(projected.y + 0.5f);
+						if (src_c >= 0 && src_r >= 0 && src_c < masks[src_index].cols && src_r < masks[src_index].rows)
+							masks[src_index].at<uchar>(src_r, src_c) = 1;
+					}
+					emitted_patch_sample = true;
+				}
+			}
+			if (!emitted_patch_sample) {
+				const int pixel = ref_patch.sample_pixels[0];
+				const int r = pixel / cols, c = pixel % cols;
+				const float sample_depth = depths[ref_index].at<float>(r, c);
+				const cv::Vec3f sample_normal = normals[ref_index].at<cv::Vec3f>(r, c);
+				const bool inside_block = !use_block || blocks[ref_index].at<uchar>(r, c) >= 128;
+				if (inside_block && masks[ref_index].at<uchar>(r, c) == 0 &&
+					IsFiniteFloat(sample_depth) && sample_depth > 0.0f && IsValidNormal(sample_normal)) {
+					const float3 sample_world = Get3DPointonWorld(c, r, sample_depth, cameras[ref_index]);
+					PointList point3D;
+					point3D.coord = sample_world;
+					point3D.normal = make_float3(sample_normal[0], sample_normal[1], sample_normal[2]);
+					const cv::Vec3b color = images[ref_index].at<cv::Vec3b>(r, c);
+					point3D.color = make_float3(color[0], color[1], color[2]);
+					plane_point_cloud.emplace_back(point3D);
+					for (int src_index : supporting_images) {
+						float2 projected;
+						float projected_depth;
+						ProjectCamera(sample_world, cameras[src_index], projected, projected_depth);
+						const int src_c = static_cast<int>(projected.x + 0.5f);
+						const int src_r = static_cast<int>(projected.y + 0.5f);
+						if (src_c >= 0 && src_r >= 0 && src_c < masks[src_index].cols && src_r < masks[src_index].rows)
+							masks[src_index].at<uchar>(src_r, src_c) = 1;
+					}
+				}
+			}
+		}
+
+			for (int r = 0; r < rows; ++r) {
+				for (int c = 0; c < cols; ++c) {
+					if (use_block && blocks[ref_index].at<uchar>(r, c) < 128) continue;
+					if (masks[ref_index].at<uchar>(r, c) == 1) continue;
+					const int patch_id = ref_map.labels.at<int>(r, c);
+					if (patch_id >= 0 && consumed_patches[ref_index][patch_id]) {
+						++patch_pixels_skipped;
+						continue;
+					}
+					float ref_depth = depths[ref_index].at<float>(r, c);
+					if (!IsFiniteFloat(ref_depth) || ref_depth <= 0.0f) continue;
+					cv::Vec3f ref_normal = normals[ref_index].at<cv::Vec3f>(r, c);
+					if (!IsValidNormal(ref_normal)) continue;
+
+					const float3 PointX = Get3DPointonWorld(c, r, ref_depth, cameras[ref_index]);
+					++fallback_pixels_tested;
+					int num_consistent = 0;
+					float dynamic_consistency = 0.0f;
+					std::vector<int2> used_list(num_ngb, make_int2(-1, -1));
+					for (int j = 0; j < num_ngb; ++j) {
+						const int src_index = imageIdToindexMap[problem.src_image_ids[j]];
+						float2 point;
+						float proj_depth;
+						ProjectCamera(PointX, cameras[src_index], point, proj_depth);
+						const int src_r = int(point.y + 0.5f);
+						const int src_c = int(point.x + 0.5f);
+						if (src_c < 0 || src_c >= depths[src_index].cols || src_r < 0 || src_r >= depths[src_index].rows ||
+							masks[src_index].at<uchar>(src_r, src_c) == 1) continue;
+
+						const float src_depth = depths[src_index].at<float>(src_r, src_c);
+						if (!IsFiniteFloat(src_depth) || src_depth <= 0.0f) continue;
+						const cv::Vec3f src_normal = normals[src_index].at<cv::Vec3f>(src_r, src_c);
+						if (!IsValidNormal(src_normal)) continue;
+						const float3 tmp_X = Get3DPointonWorld(src_c, src_r, src_depth, cameras[src_index]);
+					float2 tmp_pt;
+					float reproj_depth;
+					ProjectCamera(tmp_X, cameras[ref_index], tmp_pt, reproj_depth);
+					const float reproj_error = std::sqrt((c - tmp_pt.x) * (c - tmp_pt.x) + (r - tmp_pt.y) * (r - tmp_pt.y));
+					const float relative_depth_diff = std::fabs(proj_depth - src_depth) / std::max(1e-6f, proj_depth);
+					const float angle = GetAngle(ref_normal, src_normal);
+					if (reproj_error < 2.0f && relative_depth_diff < 0.01f && angle < 0.174533f) {
+						used_list[j] = make_int2(src_c, src_r);
+						const float score = reproj_error + 200.0f * relative_depth_diff + angle * 10.0f;
+						dynamic_consistency += std::exp(-score);
+						++num_consistent;
+					}
+				}
+				const float factor = (weaks[ref_index].at<uchar>(r, c) == WEAK ? 0.45f : 0.3f);
+				if (num_consistent < 1 || dynamic_consistency <= factor * num_consistent) continue;
+
+				PointList point3D;
+				point3D.coord = PointX;
+				point3D.normal = make_float3(ref_normal[0], ref_normal[1], ref_normal[2]);
+				float consistent_color[3] = {
+					static_cast<float>(images[ref_index].at<cv::Vec3b>(r, c)[0]),
+					static_cast<float>(images[ref_index].at<cv::Vec3b>(r, c)[1]),
+					static_cast<float>(images[ref_index].at<cv::Vec3b>(r, c)[2])};
+				for (int j = 0; j < num_ngb; ++j) {
+					if (used_list[j].x < 0) continue;
+					const int src_index = imageIdToindexMap[problem.src_image_ids[j]];
+					masks[src_index].at<uchar>(used_list[j].y, used_list[j].x) = 1;
+					const cv::Vec3b color = images[src_index].at<cv::Vec3b>(used_list[j].y, used_list[j].x);
+					for (int channel = 0; channel < 3; ++channel) consistent_color[channel] += color[channel];
+				}
+			for (float &channel : consistent_color) channel /= (num_consistent + 1);
+			point3D.color = make_float3(consistent_color[0], consistent_color[1], consistent_color[2]);
+			plane_point_cloud.emplace_back(point3D);
+				}
+			}
+		}
+		const auto fusion_end = std::chrono::steady_clock::now();
+		std::cout << "Plane fusion time: " << std::chrono::duration<double>(fusion_end - fusion_start).count()
+			<< " s; fused " << fused_plane_patches << " plane patches and emitted "
+			<< plane_point_cloud.size() << " points; tested " << fallback_pixels_tested
+			<< " fallback pixels and skipped " << patch_pixels_skipped
+			<< " pixels represented by accepted plane ranges.\n";
+		const path ply_path = dense_folder / path("DPE") / path("DPE.ply");
+		ExportPointCloud(ply_path, plane_point_cloud);
+		const path fused_path = dense_folder / path("DPE") / path("fused.ply");
+		if (!ExportFusedPointCloud(fused_path, plane_point_cloud))
+			throw std::runtime_error("Failed to write " + fused_path.string());
+		return;
 	}
 	std::vector<PointList> PointCloud;
 	PointCloud.clear();

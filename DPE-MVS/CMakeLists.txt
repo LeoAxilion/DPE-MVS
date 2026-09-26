@@ -4,6 +4,12 @@ SET(CMAKE_CXX_COMPILER /usr/bin/g++)
 cmake_minimum_required (VERSION 2.8)
 project (DPE)
 
+# Single-configuration generators otherwise compile the CPU stages without
+# optimization when the user does not pass a build type.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(Boost_USE_STATIC_LIBS ON)
 set(Boost_USE_MULTITHREADED ON)
 set(Boost_USE_STATIC_RUNTIME OFF)
@@ -30,7 +36,8 @@ if(CMAKE_COMPILER_IS_GNUCXX)
     add_definitions(-pedantic)
     add_definitions(-Wno-unused-function)
     add_definitions(-Wno-switch)
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -ffast-math -march=native")
+    # Keep CMake's optimized Release flags without host-side fast-math: the
+    # adaptive geometry checks rely on finite-value and threshold comparisons.
 endif()
 
 cuda_add_executable(

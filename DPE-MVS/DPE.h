@@ -44,7 +44,8 @@ std::string ToFormatIndex(int index);
 template <typename TYPE>
 void RescaleMatToTargetSize(const cv::Mat &src, cv::Mat &dst, const cv::Size2i &target_size);
 
-void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride = 1);
+void RunFusion(const path &dense_folder, const std::vector<Problem> &problems,
+	int simple_region_stride = 1, bool plane_fusion = false, int plane_sample_stride = 4);
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems);
 void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem> &problems);
 
@@ -106,6 +107,9 @@ public:
 	float4 GetPlaneHypothesis(int r, int c);
 	cv::Mat GetEdge();
 	cv::Mat GetPixelStates();
+	void UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
+		const cv::Mat &confidence_costs);
+	cv::Mat GetConfidenceCosts();
 	cv::Mat GetSelectedViews();
 	float GetAdaptiveFrozenFraction() const;
 	cv::Mat GetRadiusMap();
@@ -177,6 +181,7 @@ private:
 	float *complex_cuda;
 	// cost cuda 
 	float *costs_cuda;
+	cv::Mat confidence_cost_host;
 	// =========================
 	// other var
 	// params

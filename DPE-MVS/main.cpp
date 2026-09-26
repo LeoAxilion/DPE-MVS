@@ -1,5 +1,6 @@
 #include "main.h"
 #include "DPE.h"
+#include <cstdlib>
 
 using namespace boost::filesystem;
 
@@ -157,17 +158,35 @@ float ProcessProblem(const Problem &problem) {
     std::cout << "iteration: " << problem.iteration << std::endl;
 	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 
+	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
+	auto profile_start = start;
+	const auto profile_stage = [&](const char *name) {
+		if (!profile) return;
+		const auto now = std::chrono::steady_clock::now();
+		std::cout << "Profile CPU " << name << ": "
+			<< std::chrono::duration<double, std::milli>(now - profile_start).count() << " ms\n";
+		profile_start = now;
+	};
 	DPE DPE(problem);
 	DPE.InuputInitialization();
+	profile_stage("input");
 	DPE.SupportInitialization();
+	profile_stage("support");
 	DPE.CudaSpaceInitialization();
 	DPE.SetDataPassHelperInCuda();
+	profile_stage("upload");
 	DPE.RunPatchMatch();
+	profile_stage("patchmatch");
 
 	int width = DPE.GetWidth(), height = DPE.GetHeight();
 	cv::Mat depth = cv::Mat(height, width, CV_32FC1);
 	cv::Mat normal = cv::Mat(height, width, CV_32FC3);
 	cv::Mat pixel_states = DPE.GetPixelStates();
+	cv::Mat confidence_costs = DPE.GetConfidenceCosts();
+	// DepthToWeak has now produced the real confidence state. Freeze STRONG
+	// pixels and low-cost WEAK pixels here so the initial scale is also eligible
+	// without using its temporary all-STRONG initialization state.
+	DPE.UpdateAdaptiveMaskFromConfidence(pixel_states, confidence_costs);
 	for (int r = 0; r < height; ++r) {
 		for (int c = 0; c < width; ++c) {
 			float4 plane_hypothesis = DPE.GetPlaneHypothesis(r, c);
@@ -210,6 +229,7 @@ float ProcessProblem(const Problem &problem) {
 			// remove(point_cloud_path);
 		}
 	}
+	profile_stage("output");
 	std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 	std::cout << "Processing image: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << " done!" << std::endl;
 	std::cout << "Cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
@@ -246,7 +266,8 @@ int main(int argc, char **argv) {
                      "[--adaptive-refinement] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
-                     "[--adaptive-point-sampling] [--simple-region-stride N] "
+					 "[--adaptive-point-sampling] [--simple-region-stride N] "
+					 "[--plane-fusion] [--plane-sample-stride N] "
                      "[--start-round N]\n";
         return EXIT_FAILURE;
     }
@@ -260,6 +281,8 @@ int main(int argc, char **argv) {
     float adaptive_refinement_early_stop = 0.0f;
     bool adaptive_point_sampling = false;
     int simple_region_stride = 2;
+    bool plane_fusion = false;
+    int plane_sample_stride = 4;
     int start_round = 0;
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).find("--") != 0) {
@@ -289,6 +312,14 @@ int main(int argc, char **argv) {
                     throw std::invalid_argument("adaptive-refinement-early-stop must be between 0 and 1");
             }
             else if (option == "--adaptive-point-sampling") adaptive_point_sampling = true;
+			else if (option == "--plane-fusion") plane_fusion = true;
+			else if (option == "--plane-sample-stride" && arg < argc) {
+				const std::string value(argv[arg++]);
+				size_t end = 0;
+				plane_sample_stride = std::stoi(value, &end);
+				if (end != value.size() || plane_sample_stride < 1)
+					throw std::invalid_argument("plane-sample-stride must be >= 1");
+			}
             else if (option == "--simple-region-stride" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -332,8 +363,9 @@ int main(int argc, char **argv) {
 	std::cout << "Adaptive refinement: " << adaptive_refinement << " (aggressiveness "
 		<< adaptive_refinement_aggressiveness << ", early-stop threshold "
 		<< adaptive_refinement_early_stop << ")" << std::endl;
-	std::cout << "Adaptive point sampling: " << adaptive_point_sampling
+    std::cout << "Adaptive point sampling: " << adaptive_point_sampling
 	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
+	std::cout << "Plane fusion: " << plane_fusion << " (sample stride " << plane_sample_stride << ")" << std::endl;
 	if (!CheckImages(problems)) {
 		std::cerr << "Images may error, check it!\n";
 		return EXIT_FAILURE;
@@ -346,7 +378,8 @@ int main(int argc, char **argv) {
 			std::cerr << "Fusion inputs are incomplete. Run depth estimation first." << std::endl;
 			return EXIT_FAILURE;
 		}
-		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1);
+		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
+			plane_fusion, plane_sample_stride);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
 		print_total_elapsed();
 		return EXIT_SUCCESS;
@@ -446,10 +479,20 @@ int main(int argc, char **argv) {
 			}
 			iteration_index++;
 		}
+		// Persist once per completed scale, including images that stopped early.
+		// --start-round can reload these checkpoints in a fresh process.
+		if (adaptive_refinement) {
+			for (const auto &problem : problems) {
+				const auto &state = *problem.adaptive_state;
+				WriteBinMat(problem.result_folder / "adaptive_frozen.dmb", state.mask);
+				WriteBinMat(problem.result_folder / "adaptive_stability.dmb", state.stability);
+			}
+		}
 		std::cout << "Round: " << i << " done\n";
 	}
 
-	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1);
+	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
+		plane_fusion, plane_sample_stride);
 	{// delete files
 		for (size_t i = 0; i < problems.size(); ++i) {
 			const auto &problem = problems[i];
