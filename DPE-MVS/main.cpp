@@ -133,7 +133,7 @@ void GetProblemEdges(const Problem &problem) {
 	std::cout << "Getting image edges: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << " done!" << std::endl;
 }
 
-int ComputeRoundNum(const std::vector<Problem> &problems) {
+int ComputeRoundNum(const std::vector<Problem> &problems, int min_pyramid_levels) {
 	if (problems.size() == 0) {
 		return 0;
 	}
@@ -149,7 +149,7 @@ int ComputeRoundNum(const std::vector<Problem> &problems) {
 		max_size /= 2;
 		round_num++;
 	}
-	return round_num;
+	return MAX(round_num, min_pyramid_levels);
 }
 
 
@@ -268,6 +268,7 @@ int main(int argc, char **argv) {
 					 "[--adaptive-refinement-early-stop FRACTION] "
 					 "[--adaptive-point-sampling] [--simple-region-stride N] "
 					 "[--plane-fusion] [--plane-sample-stride N] "
+					 "[--min-pyramid-levels N] "
                      "[--start-round N]\n";
         return EXIT_FAILURE;
     }
@@ -283,6 +284,7 @@ int main(int argc, char **argv) {
     int simple_region_stride = 2;
     bool plane_fusion = false;
     int plane_sample_stride = 4;
+    int min_pyramid_levels = 1;
     int start_round = 0;
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).find("--") != 0) {
@@ -327,6 +329,13 @@ int main(int argc, char **argv) {
                 if (end != value.size() || simple_region_stride < 1)
                     throw std::invalid_argument("simple-region-stride must be >= 1");
             }
+            else if (option == "--min-pyramid-levels" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                min_pyramid_levels = std::stoi(value, &end);
+                if (end != value.size() || min_pyramid_levels < 1)
+                    throw std::invalid_argument("min-pyramid-levels must be >= 1");
+            }
             else if (option == "--start-round" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -366,6 +375,7 @@ int main(int argc, char **argv) {
     std::cout << "Adaptive point sampling: " << adaptive_point_sampling
 	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
 	std::cout << "Plane fusion: " << plane_fusion << " (sample stride " << plane_sample_stride << ")" << std::endl;
+	std::cout << "Minimum pyramid levels: " << min_pyramid_levels << std::endl;
 	if (!CheckImages(problems)) {
 		std::cerr << "Images may error, check it!\n";
 		return EXIT_FAILURE;
@@ -387,7 +397,7 @@ int main(int argc, char **argv) {
 
 	cudaSetDevice(gpu_index);
 
-	int round_num = ComputeRoundNum(problems);
+	int round_num = ComputeRoundNum(problems, min_pyramid_levels);
 	if (start_round >= round_num) {
 		std::cerr << "Start round " << start_round << " is outside the pyramid (0.."
 			<< (round_num - 1) << ").\n";
