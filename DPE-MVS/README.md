@@ -118,6 +118,14 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   Use it only when every per-image depth, normal, weak-state, and selected-view
   file in the output folder belongs to the immediately preceding scale.
 
+  `--min-pyramid-levels N` keeps at least `N` pyramid levels even when the
+  image-size rule would normally produce fewer. `--pyramid-levels N` instead
+  selects exactly `N` levels, including the final full-resolution level capped
+  by `--max-image-size`; it is mutually exclusive with
+  `--min-pyramid-levels`. For example, with `--max-image-size 800`,
+  `--pyramid-levels 3` processes 200, 400, and 800 pixels along the longest
+  image dimension.
+
 If you need to filter out the sky during point cloud fusion, you can use a segmentation approach. Please refer to [MP-MVS](https://github.com/RongxuanTan/MP-MVS) and save the segmentation results in the $data_folder/blocks directory.
 
 ## Acknowledgements

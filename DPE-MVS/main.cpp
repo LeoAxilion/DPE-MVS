@@ -133,7 +133,11 @@ void GetProblemEdges(const Problem &problem) {
 	std::cout << "Getting image edges: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << " done!" << std::endl;
 }
 
-int ComputeRoundNum(const std::vector<Problem> &problems, int min_pyramid_levels) {
+int ComputeRoundNum(const std::vector<Problem> &problems, int min_pyramid_levels,
+	int exact_pyramid_levels) {
+	if (exact_pyramid_levels > 0) {
+		return exact_pyramid_levels;
+	}
 	if (problems.size() == 0) {
 		return 0;
 	}
@@ -267,8 +271,9 @@ int main(int argc, char **argv) {
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
 					 "[--adaptive-point-sampling] [--simple-region-stride N] "
-					 "[--plane-fusion] [--plane-sample-stride N] "
-					 "[--min-pyramid-levels N] "
+						 "[--plane-fusion] [--plane-sample-stride N] "
+						 "[--min-pyramid-levels N] "
+						 "[--pyramid-levels N] "
                      "[--start-round N]\n";
         return EXIT_FAILURE;
     }
@@ -285,6 +290,9 @@ int main(int argc, char **argv) {
     bool plane_fusion = false;
     int plane_sample_stride = 4;
     int min_pyramid_levels = 1;
+    int exact_pyramid_levels = 0;
+    bool min_pyramid_levels_explicit = false;
+    bool exact_pyramid_levels_explicit = false;
     int start_round = 0;
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).find("--") != 0) {
@@ -330,12 +338,25 @@ int main(int argc, char **argv) {
                     throw std::invalid_argument("simple-region-stride must be >= 1");
             }
             else if (option == "--min-pyramid-levels" && arg < argc) {
+				if (exact_pyramid_levels_explicit)
+					throw std::invalid_argument("--min-pyramid-levels cannot be combined with --pyramid-levels");
                 const std::string value(argv[arg++]);
                 size_t end = 0;
                 min_pyramid_levels = std::stoi(value, &end);
                 if (end != value.size() || min_pyramid_levels < 1)
                     throw std::invalid_argument("min-pyramid-levels must be >= 1");
-            }
+				min_pyramid_levels_explicit = true;
+			}
+			else if (option == "--pyramid-levels" && arg < argc) {
+				if (min_pyramid_levels_explicit)
+					throw std::invalid_argument("--pyramid-levels cannot be combined with --min-pyramid-levels");
+				const std::string value(argv[arg++]);
+				size_t end = 0;
+				exact_pyramid_levels = std::stoi(value, &end);
+				if (end != value.size() || exact_pyramid_levels < 1)
+					throw std::invalid_argument("pyramid-levels must be >= 1");
+				exact_pyramid_levels_explicit = true;
+			}
             else if (option == "--start-round" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -375,7 +396,10 @@ int main(int argc, char **argv) {
     std::cout << "Adaptive point sampling: " << adaptive_point_sampling
 	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
 	std::cout << "Plane fusion: " << plane_fusion << " (sample stride " << plane_sample_stride << ")" << std::endl;
-	std::cout << "Minimum pyramid levels: " << min_pyramid_levels << std::endl;
+	if (exact_pyramid_levels > 0)
+		std::cout << "Exact pyramid levels: " << exact_pyramid_levels << std::endl;
+	else
+		std::cout << "Minimum pyramid levels: " << min_pyramid_levels << std::endl;
 	if (!CheckImages(problems)) {
 		std::cerr << "Images may error, check it!\n";
 		return EXIT_FAILURE;
@@ -397,7 +421,7 @@ int main(int argc, char **argv) {
 
 	cudaSetDevice(gpu_index);
 
-	int round_num = ComputeRoundNum(problems, min_pyramid_levels);
+	int round_num = ComputeRoundNum(problems, min_pyramid_levels, exact_pyramid_levels);
 	if (start_round >= round_num) {
 		std::cerr << "Start round " << start_round << " is outside the pyramid (0.."
 			<< (round_num - 1) << ").\n";
