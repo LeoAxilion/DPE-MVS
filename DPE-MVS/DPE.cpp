@@ -494,7 +494,7 @@ cv::Mat EdgeSegment(const int scale, const cv::Mat& src_image, int mode, bool us
 bool ReadBinMat(const path &mat_path, cv::Mat &mat)
 {
 	ifstream in(mat_path, std::ios_base::binary);
-	if (in.bad()) {
+	if (!in.is_open()) {
 		std::cerr << "Error opening file: " << mat_path << std::endl;
 		return false;
 	}
@@ -505,16 +505,28 @@ bool ReadBinMat(const path &mat_path, cv::Mat &mat)
 	in.read((char *)(&cols), sizeof(int));
 	in.read((char *)(&type), sizeof(int));
 
-	if (version != 1) {
+	if (!in || version != 1 || rows <= 0 || cols <= 0 || type < 0 || type > CV_MAT_TYPE_MASK) {
 		in.close();
-		std::cerr << "Version error: " << mat_path << std::endl;
+		std::cerr << "Invalid matrix header in " << mat_path << ": version=" << version
+			<< ", rows=" << rows << ", cols=" << cols << ", type=" << type << std::endl;
+		return false;
+	}
+	in.seekg(0, std::ios::end);
+	const std::streamoff actual_bytes = in.tellg();
+	in.seekg(sizeof(int) * 4, std::ios::beg);
+	const uint64_t expected_bytes = sizeof(int) * 4ULL +
+		static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols) * CV_ELEM_SIZE(type);
+	if (actual_bytes < 0 || expected_bytes > static_cast<uint64_t>(actual_bytes)) {
+		in.close();
+		std::cerr << "Truncated matrix file " << mat_path << ": expected " << expected_bytes
+			<< " bytes, found " << (actual_bytes < 0 ? 0 : actual_bytes) << std::endl;
 		return false;
 	}
 
 	mat = cv::Mat(rows, cols, type);
 	in.read((char *)mat.data, sizeof(char) * mat.step * mat.rows);
 	in.close();
-	return true;
+	return static_cast<bool>(in);
 
 }
 
@@ -953,7 +965,10 @@ DPE::~DPE() {
 	cudaFree(view_weight_cuda);
 	cudaFree(weak_nearest_strong);
 	cudaFree(adaptive_refinement_mask_cuda);
+	cudaFree(adaptive_freeze_counters_cuda);
 	cudaFree(active_pixel_indices_cuda);
+	cudaFree(active_pixel_indices_black_cuda);
+	cudaFree(active_pixel_indices_red_cuda);
 #ifdef DEBUG_COST_LINE
 	cudaFree(weak_ncc_cost_cuda);
 #endif // DEBUG_COST_LINE
@@ -1164,8 +1179,8 @@ void DPE::CudaSpaceInitialization() {
 	// move images to gpu
 	for (int i = 0; i < num_images; ++i) {
 		cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-		cudaMallocArray(&cuArray[i], &channelDesc, width, height);
-		cudaMemcpy2DToArray(cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], width * sizeof(float), height, cudaMemcpyHostToDevice);
+		CUDA_SAFE_CALL(cudaMallocArray(&cuArray[i], &channelDesc, width, height));
+		CUDA_SAFE_CALL(cudaMemcpy2DToArray(cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], width * sizeof(float), height, cudaMemcpyHostToDevice));
 		struct cudaResourceDesc resDesc;
 		memset(&resDesc, 0, sizeof(cudaResourceDesc));
 		resDesc.resType = cudaResourceTypeArray;
@@ -1177,18 +1192,18 @@ void DPE::CudaSpaceInitialization() {
 		texDesc.filterMode = cudaFilterModeLinear;
 		texDesc.readMode = cudaReadModeElementType;
 		texDesc.normalizedCoords = 0;
-		cudaCreateTextureObject(&(texture_objects_host.images[i]), &resDesc, &texDesc, NULL);
+		CUDA_SAFE_CALL(cudaCreateTextureObject(&(texture_objects_host.images[i]), &resDesc, &texDesc, NULL));
 	}
-	cudaMalloc((void**)&texture_objects_cuda, sizeof(cudaTextureObjects));
-	cudaMemcpy(texture_objects_cuda, &texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&texture_objects_cuda, sizeof(cudaTextureObjects)));
+	CUDA_SAFE_CALL(cudaMemcpy(texture_objects_cuda, &texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice));
 	// may move depths to gpu
 	if (params_host.geom_consistency) {
 		for (int i = 0; i < num_images; ++i) {
 			int height = depths[i].rows;
 			int width = depths[i].cols;
 			cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-			cudaMallocArray(&cuDepthArray[i], &channelDesc, width, height);
-			cudaMemcpy2DToArray(cuDepthArray[i], 0, 0, depths[i].ptr<float>(), depths[i].step[0], width * sizeof(float), height, cudaMemcpyHostToDevice);
+			CUDA_SAFE_CALL(cudaMallocArray(&cuDepthArray[i], &channelDesc, width, height));
+			CUDA_SAFE_CALL(cudaMemcpy2DToArray(cuDepthArray[i], 0, 0, depths[i].ptr<float>(), depths[i].step[0], width * sizeof(float), height, cudaMemcpyHostToDevice));
 			struct cudaResourceDesc resDesc;
 			memset(&resDesc, 0, sizeof(cudaResourceDesc));
 			resDesc.resType = cudaResourceTypeArray;
@@ -1200,95 +1215,135 @@ void DPE::CudaSpaceInitialization() {
 			texDesc.filterMode = cudaFilterModeLinear;
 			texDesc.readMode = cudaReadModeElementType;
 			texDesc.normalizedCoords = 0;
-			cudaCreateTextureObject(&(texture_depths_host.images[i]), &resDesc, &texDesc, NULL);
+			CUDA_SAFE_CALL(cudaCreateTextureObject(&(texture_depths_host.images[i]), &resDesc, &texDesc, NULL));
 		}
-		cudaMalloc((void**)&texture_depths_cuda, sizeof(cudaTextureObjects));
-		cudaMemcpy(texture_depths_cuda, &texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice);
+		CUDA_SAFE_CALL(cudaMalloc((void**)&texture_depths_cuda, sizeof(cudaTextureObjects)));
+		CUDA_SAFE_CALL(cudaMemcpy(texture_depths_cuda, &texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice));
 	}
 	// =================================================
 	// move camera to gpu
-	cudaMalloc((void**)&cameras_cuda, sizeof(Camera) * (num_images));
-	cudaMemcpy(cameras_cuda, &cameras[0], sizeof(Camera) * (num_images), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&cameras_cuda, sizeof(Camera) * (num_images)));
+	CUDA_SAFE_CALL(cudaMemcpy(cameras_cuda, &cameras[0], sizeof(Camera) * (num_images), cudaMemcpyHostToDevice));
 	// malloc memory for important data structure
 	const int length = width * height;
 	// define cost
-	cudaMalloc((void**)&costs_cuda, sizeof(float) * length);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&costs_cuda, sizeof(float) * length));
 	// malloc memory for rand states
-	cudaMalloc((void**)&rand_states_cuda, sizeof(curandState) * length);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&rand_states_cuda, sizeof(curandState) * length));
 	// malloc for selected_views
-	cudaMalloc((void**)&selected_views_cuda, sizeof(unsigned int) * length);
-	cudaMemcpy(selected_views_cuda, selected_views_host.ptr<unsigned int>(0), sizeof(unsigned int) * length, cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&selected_views_cuda, sizeof(unsigned int) * length));
+	CUDA_SAFE_CALL(cudaMemcpy(selected_views_cuda, selected_views_host.ptr<unsigned int>(0), sizeof(unsigned int) * length, cudaMemcpyHostToDevice));
 	// view weight
-	cudaMalloc((void**)&view_weight_cuda, sizeof(uchar) * length * MAX_IMAGES);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&view_weight_cuda, sizeof(uchar) * length * MAX_IMAGES));
 	// move plane hypotheses to gpu
-	cudaMalloc((void**)&plane_hypotheses_cuda, sizeof(float4) * length);
-	cudaMemcpy(plane_hypotheses_cuda, plane_hypotheses_host, sizeof(float4) * length, cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&plane_hypotheses_cuda, sizeof(float4) * length));
+	CUDA_SAFE_CALL(cudaMemcpy(plane_hypotheses_cuda, plane_hypotheses_host, sizeof(float4) * length, cudaMemcpyHostToDevice));
 	// malloc memory for fit plane 
-	cudaMalloc((void**)&fit_plane_hypotheses_cuda, sizeof(float4) * length);
-	cudaMemset(fit_plane_hypotheses_cuda, 0, sizeof(float4) * length);
-	cudaMalloc((void**)&fit_plane_valid_cuda, length);
-	cudaMemset(fit_plane_valid_cuda, 0, length);
+	CUDA_SAFE_CALL(cudaMalloc((void**)&fit_plane_hypotheses_cuda, sizeof(float4) * length));
+	CUDA_SAFE_CALL(cudaMemset(fit_plane_hypotheses_cuda, 0, sizeof(float4) * length));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&fit_plane_valid_cuda, length));
+	CUDA_SAFE_CALL(cudaMemset(fit_plane_valid_cuda, 0, length));
 
 	// malloc edge array
 	if (problem.params.use_edge || problem.params.use_limit) {
-		cudaMalloc((void**)&edge_cuda, sizeof(uint8_t) * length);
-		cudaMemcpy(edge_cuda, edge_host.ptr<uchar>(0), sizeof(uchar) * length, cudaMemcpyHostToDevice);
-		cudaMalloc((void**)&edge_low_res_cuda, sizeof(uint8_t) * low_height * low_width);
-		cudaMemcpy(edge_low_res_cuda, edge_low_res_host.ptr<uchar>(0), sizeof(uchar) * low_height * low_width, cudaMemcpyHostToDevice);
+		CUDA_SAFE_CALL(cudaMalloc((void**)&edge_cuda, sizeof(uint8_t) * length));
+		CUDA_SAFE_CALL(cudaMemcpy(edge_cuda, edge_host.ptr<uchar>(0), sizeof(uchar) * length, cudaMemcpyHostToDevice));
+		CUDA_SAFE_CALL(cudaMalloc((void**)&edge_low_res_cuda, sizeof(uint8_t) * low_height * low_width));
+		CUDA_SAFE_CALL(cudaMemcpy(edge_low_res_cuda, edge_low_res_host.ptr<uchar>(0), sizeof(uchar) * low_height * low_width, cudaMemcpyHostToDevice));
 	}
 	if (problem.params.use_edge) {
-		cudaMalloc((void **)(&edge_neigh_cuda), length * 8 * sizeof(short2));
-		cudaMalloc((void**)&complex_cuda, sizeof(float) * length);
+		CUDA_SAFE_CALL(cudaMalloc((void **)(&edge_neigh_cuda), length * 8 * sizeof(short2)));
+		CUDA_SAFE_CALL(cudaMalloc((void**)&complex_cuda, sizeof(float) * length));
 	}
 	if (problem.params.use_label) {
-		cudaMalloc((void**)(&label_cuda), length * sizeof(int));
-		cudaMemcpy(label_cuda, label_host.ptr<int>(0), sizeof(int) * (height * width), cudaMemcpyHostToDevice);
-		cudaMalloc((void **)(&label_boundary_cuda), weak_count * 8 * sizeof(short2));
+		CUDA_SAFE_CALL(cudaMalloc((void**)(&label_cuda), length * sizeof(int)));
+		CUDA_SAFE_CALL(cudaMemcpy(label_cuda, label_host.ptr<int>(0), sizeof(int) * (height * width), cudaMemcpyHostToDevice));
+		if (weak_count > 0) {
+			CUDA_SAFE_CALL(cudaMalloc((void **)(&label_boundary_cuda), weak_count * 8 * sizeof(short2)));
+		} else {
+			label_boundary_cuda = nullptr;
+		}
 	}
 	if (problem.params.use_radius) {
-		cudaMalloc((void**)(&radius_cuda), length * sizeof(int));
+		CUDA_SAFE_CALL(cudaMalloc((void**)(&radius_cuda), length * sizeof(int)));
 	}
 	if (params_host.adaptive_refinement) {
-		cudaMalloc((void**)(&adaptive_refinement_mask_cuda), length * sizeof(uchar));
-		cudaMemcpy(adaptive_refinement_mask_cuda, adaptive_refinement_mask_host.ptr<uchar>(0),
-			length * sizeof(uchar), cudaMemcpyHostToDevice);
+		CUDA_SAFE_CALL(cudaMalloc((void**)(&adaptive_refinement_mask_cuda), length * sizeof(uchar)));
+		CUDA_SAFE_CALL(cudaMemcpy(adaptive_refinement_mask_cuda, adaptive_refinement_mask_host.ptr<uchar>(0),
+			length * sizeof(uchar), cudaMemcpyHostToDevice));
+		CUDA_SAFE_CALL(cudaMalloc((void**)(&adaptive_freeze_counters_cuda), 4 * sizeof(int)));
+		CUDA_SAFE_CALL(cudaMemset(adaptive_freeze_counters_cuda, 0, 4 * sizeof(int)));
 		active_pixel_count = length;
-		if (adaptive_frozen_fraction >= 0.25f &&
+		const bool use_compact_lists = params_host.regional_adaptive_pyramid ||
+			adaptive_frozen_fraction >= 0.25f;
+		if (use_compact_lists &&
 			cv::countNonZero(adaptive_refinement_mask_host) < length) {
 			std::vector<int> active_pixels;
+			std::vector<int> active_black_pixels;
+			std::vector<int> active_red_pixels;
 			active_pixels.reserve(static_cast<size_t>(length * (1.0f - adaptive_frozen_fraction)));
+			active_black_pixels.reserve(active_pixels.capacity() / 2 + 1);
+			active_red_pixels.reserve(active_pixels.capacity() / 2 + 1);
 			for (int r = 0; r < height; ++r) {
 				const uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
 				for (int c = 0; c < width; ++c)
-					if (mask_row[c] != 0) active_pixels.push_back(r * width + c);
+					if (mask_row[c] != 0) {
+						const int index = r * width + c;
+						active_pixels.push_back(index);
+						if (((r + c) & 1) == 0) active_black_pixels.push_back(index);
+						else active_red_pixels.push_back(index);
+					}
 			}
 			active_pixel_count = static_cast<int>(active_pixels.size());
 			if (active_pixel_count > 0) {
-				cudaMalloc((void**)(&active_pixel_indices_cuda), active_pixel_count * sizeof(int));
-				cudaMemcpy(active_pixel_indices_cuda, active_pixels.data(), active_pixel_count * sizeof(int),
-					cudaMemcpyHostToDevice);
+				CUDA_SAFE_CALL(cudaMalloc((void**)(&active_pixel_indices_cuda), active_pixel_count * sizeof(int)));
+				CUDA_SAFE_CALL(cudaMemcpy(active_pixel_indices_cuda, active_pixels.data(), active_pixel_count * sizeof(int),
+					cudaMemcpyHostToDevice));
+			}
+			active_pixel_black_count = static_cast<int>(active_black_pixels.size());
+			if (active_pixel_black_count > 0) {
+				CUDA_SAFE_CALL(cudaMalloc((void**)(&active_pixel_indices_black_cuda),
+					active_pixel_black_count * sizeof(int)));
+				CUDA_SAFE_CALL(cudaMemcpy(active_pixel_indices_black_cuda, active_black_pixels.data(),
+					active_pixel_black_count * sizeof(int), cudaMemcpyHostToDevice));
+			}
+			active_pixel_red_count = static_cast<int>(active_red_pixels.size());
+			if (active_pixel_red_count > 0) {
+				CUDA_SAFE_CALL(cudaMalloc((void**)(&active_pixel_indices_red_cuda),
+					active_pixel_red_count * sizeof(int)));
+				CUDA_SAFE_CALL(cudaMemcpy(active_pixel_indices_red_cuda, active_red_pixels.data(),
+					active_pixel_red_count * sizeof(int), cudaMemcpyHostToDevice));
 			}
 		}
 	}
 
 	// malloc memory for weak info
-	cudaMalloc((void **)(&weak_info_cuda), length * sizeof(uchar));
-	cudaMemcpy(weak_info_cuda, weak_info_host.ptr<uchar>(0), length * sizeof(uchar), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void **)(&weak_info_cuda), length * sizeof(uchar)));
+	CUDA_SAFE_CALL(cudaMemcpy(weak_info_cuda, weak_info_host.ptr<uchar>(0), length * sizeof(uchar), cudaMemcpyHostToDevice));
 	// malloc memory for weak reliable info
-	cudaMalloc((void **)(&weak_reliable_cuda), length * sizeof(uchar));
+	CUDA_SAFE_CALL(cudaMalloc((void **)(&weak_reliable_cuda), length * sizeof(uchar)));
 	// malloc memory for nearest strong points
-	cudaMalloc((void**)(&weak_nearest_strong), length * sizeof(short2));
+	CUDA_SAFE_CALL(cudaMalloc((void**)(&weak_nearest_strong), length * sizeof(short2)));
 	// move neighbour map to gpu
-	cudaMalloc((void**)(&neigbours_map_cuda), length * sizeof(int));
-	cudaMemcpy(neigbours_map_cuda, neighbours_map_host.ptr<int>(0), length * sizeof(int), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)(&neigbours_map_cuda), length * sizeof(int)));
+	if (neighbours_map_host.empty()) {
+		CUDA_SAFE_CALL(cudaMemset(neigbours_map_cuda, 0, length * sizeof(int)));
+	} else {
+		CUDA_SAFE_CALL(cudaMemcpy(neigbours_map_cuda, neighbours_map_host.ptr<int>(0),
+			length * sizeof(int), cudaMemcpyHostToDevice));
+	}
 	// malloc memory for deformable ncc
-	cudaMalloc((void **)(&neighbours_cuda), weak_count * NEIGHBOUR_NUM * sizeof(short2));
+	if (weak_count > 0) {
+		CUDA_SAFE_CALL(cudaMalloc((void **)(&neighbours_cuda), weak_count * NEIGHBOUR_NUM * sizeof(short2)));
+	} else {
+		neighbours_cuda = nullptr;
+	}
 	// move param to gpu
-	cudaMalloc((void**)(&params_cuda), sizeof(PatchMatchParams));
-	cudaMemcpy(params_cuda, &params_host, sizeof(PatchMatchParams), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)(&params_cuda), sizeof(PatchMatchParams)));
+	CUDA_SAFE_CALL(cudaMemcpy(params_cuda, &params_host, sizeof(PatchMatchParams), cudaMemcpyHostToDevice));
 	// =================================================
 #ifdef DEBUG_COST_LINE
-	cudaMalloc((void**)(&weak_ncc_cost_cuda), sizeof(float) * width * height * 61);
+	CUDA_SAFE_CALL(cudaMalloc((void**)(&weak_ncc_cost_cuda), sizeof(float) * width * height * 61));
 #endif // DEBUG_COST_LINE
 }
 
@@ -1436,11 +1491,15 @@ void DPE::SetDataPassHelperInCuda() {
 	helper_host.adaptive_refinement_mask_cuda = adaptive_refinement_mask_cuda;
 	helper_host.active_pixel_indices_cuda = active_pixel_indices_cuda;
 	helper_host.active_pixel_count = active_pixel_count;
+	helper_host.active_pixel_indices_black_cuda = active_pixel_indices_black_cuda;
+	helper_host.active_pixel_black_count = active_pixel_black_count;
+	helper_host.active_pixel_indices_red_cuda = active_pixel_indices_red_cuda;
+	helper_host.active_pixel_red_count = active_pixel_red_count;
 #ifdef DEBUG_COST_LINE
 	helper_host.weak_ncc_cost_cuda = weak_ncc_cost_cuda;
 #endif // DEBUG_COST_LINE
-	cudaMalloc((void**)(&helper_cuda), sizeof(DataPassHelper));
-	cudaMemcpy(helper_cuda, &helper_host, sizeof(DataPassHelper), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMalloc((void**)(&helper_cuda), sizeof(DataPassHelper)));
+	CUDA_SAFE_CALL(cudaMemcpy(helper_cuda, &helper_host, sizeof(DataPassHelper), cudaMemcpyHostToDevice));
 }
 
 float4 DPE::GetPlaneHypothesis(int r, int c) {
@@ -1455,63 +1514,56 @@ cv::Mat DPE::GetPixelStates() {
 	return weak_info_host;
 }
 
-cv::Mat DPE::GetConfidenceCosts() {
-	return confidence_cost_host;
-}
-
-void DPE::UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
-	const cv::Mat &confidence_costs, const cv::Mat &depth,
-	const cv::Mat &normal, const Camera &camera) {
-	if (!problem.params.adaptive_refinement || pixel_states.empty() ||
-		pixel_states.size() != adaptive_refinement_mask_host.size() ||
-		confidence_costs.empty() || confidence_costs.size() != pixel_states.size() ||
-		confidence_costs.type() != CV_32FC1 || !problem.update_adaptive_mask) return;
+void DPE::UpdateAdaptiveMaskFromConfidence() {
+	if (!problem.params.adaptive_refinement || adaptive_refinement_mask_host.empty() ||
+		!problem.update_adaptive_mask) return;
 	AdaptiveRefinementState &state = *problem.adaptive_state;
-	constexpr float kWeakFreezeCostThreshold = 0.15f;
-	int newly_frozen = 0;
-	int newly_frozen_strong = 0;
-	int newly_frozen_weak_low_cost = 0;
-	int geometry_rejected = 0;
+	const auto update_start = std::chrono::steady_clock::now();
+	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
 	const int min_planar_agreements = problem.params.adaptive_refinement_aggressiveness >= 3 ? 6 :
 		(problem.params.adaptive_refinement_aggressiveness == 2 ? 7 : 8);
 	const float max_normal_angle = problem.params.adaptive_refinement_aggressiveness >= 3 ? 20.0f :
 		(problem.params.adaptive_refinement_aggressiveness == 2 ? 16.0f : 12.0f);
 	const float max_relative_depth_error = problem.params.adaptive_refinement_aggressiveness >= 3 ? 0.02f :
 		(problem.params.adaptive_refinement_aggressiveness == 2 ? 0.016f : 0.0125f);
-	for (int r = 0; r < pixel_states.rows; ++r) {
-		const uchar *state_row = pixel_states.ptr<uchar>(r);
-		const float *cost_row = confidence_costs.ptr<float>(r);
-		uchar *mask_row = adaptive_refinement_mask_host.ptr<uchar>(r);
-		uchar *stability_row = state.stability.ptr<uchar>(r);
-		for (int c = 0; c < pixel_states.cols; ++c) {
-			const bool strong = state_row[c] == STRONG;
-			const bool weak_low_cost = state_row[c] == WEAK &&
-				IsFiniteFloat(cost_row[c]) && cost_row[c] <= kWeakFreezeCostThreshold;
-			bool geometry_stable = true;
-			if (problem.params.adaptive_geometry_density && (strong || weak_low_cost)) {
-				geometry_stable = IsStablePlanarNeighbourhood(depth, normal, cv::Mat(), camera, r, c,
-					min_planar_agreements, max_normal_angle, max_relative_depth_error);
-				if (!geometry_stable) ++geometry_rejected;
-			}
-			if (mask_row[c] != 0 && (strong || weak_low_cost) && geometry_stable) {
-				mask_row[c] = 0;
-				stability_row[c] = 1;
-				++newly_frozen;
-				if (strong) ++newly_frozen_strong;
-				else ++newly_frozen_weak_low_cost;
-			}
-		}
+	int counters[4] = {0, 0, 0, 0};
+	CUDA_SAFE_CALL(cudaMemset(adaptive_freeze_counters_cuda, 0, sizeof(counters)));
+	if (active_pixel_count > 0) {
+		CUDA_SAFE_CALL(cudaDeviceSynchronize());
+		CUDA_SAFE_CALL(cudaGetLastError());
+		LaunchAdaptiveFreezeMaskKernel(weak_info_cuda, costs_cuda, plane_hypotheses_cuda,
+			adaptive_refinement_mask_cuda, active_pixel_indices_cuda, active_pixel_count,
+			width, height, cameras_cuda, params_host.depth_min, params_host.depth_max,
+			problem.params.adaptive_geometry_density, min_planar_agreements,
+			max_normal_angle, max_relative_depth_error, adaptive_freeze_counters_cuda);
+		CUDA_SAFE_CALL(cudaGetLastError());
 	}
+	CUDA_SAFE_CALL(cudaMemcpy(counters, adaptive_freeze_counters_cuda, sizeof(counters),
+		cudaMemcpyDeviceToHost));
+	const cv::Mat previous_mask = adaptive_refinement_mask_host.clone();
+	CUDA_SAFE_CALL(cudaMemcpy(adaptive_refinement_mask_host.ptr<uchar>(0),
+		adaptive_refinement_mask_cuda, width * height * sizeof(uchar), cudaMemcpyDeviceToHost));
+	cv::Mat newly_frozen_mask;
+	cv::compare(previous_mask, 1, newly_frozen_mask, cv::CMP_EQ);
+	cv::Mat now_frozen_mask;
+	cv::compare(adaptive_refinement_mask_host, 0, now_frozen_mask, cv::CMP_EQ);
+	cv::bitwise_and(newly_frozen_mask, now_frozen_mask, newly_frozen_mask);
+	state.stability.setTo(1, newly_frozen_mask);
 	state.mask = adaptive_refinement_mask_host;
 	adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
 		static_cast<float>(std::max(1, adaptive_refinement_mask_host.rows * adaptive_refinement_mask_host.cols));
-	std::cout << "Adaptive confidence freeze: " << newly_frozen << " newly frozen ("
-		<< newly_frozen_strong << " strong, " << newly_frozen_weak_low_cost
-		<< " weak cost <= " << kWeakFreezeCostThreshold << "), "
+	std::cout << "Adaptive confidence freeze: " << counters[0] << " newly frozen ("
+		<< counters[1] << " strong, " << counters[2]
+		<< " weak cost <= 0.15), "
 		<< (100.0f * adaptive_frozen_fraction) << "% total";
 	if (problem.params.adaptive_geometry_density)
-		std::cout << "; geometry rejected " << geometry_rejected << " high-confidence pixels";
+		std::cout << "; geometry rejected " << counters[3] << " high-confidence pixels";
 	std::cout << std::endl;
+	if (profile) {
+		std::cout << "Profile freeze GPU confidence and geometry: "
+			<< std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - update_start).count() << " ms\n";
+	}
 }
 
 cv::Mat DPE::GetSelectedViews() {

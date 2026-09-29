@@ -133,6 +133,17 @@ void GetProblemEdges(const Problem &problem) {
 	std::cout << "Getting image edges: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << " done!" << std::endl;
 }
 
+// Edge and coarse-label maps are needed only while their corresponding
+// pyramid scale is running.  Keeping all scales until final fusion can use
+// many gigabytes for high-resolution datasets, so release the completed
+// scale before moving to the next one.
+void RemoveScaleCaches(const Problem &problem, int scale) {
+	for (const char *prefix : {"edges_max", "labels_max"}) {
+		remove(problem.result_folder / path(std::string(prefix) +
+			std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb"));
+	}
+}
+
 int ComputeRoundNum(const std::vector<Problem> &problems, int min_pyramid_levels,
 	int exact_pyramid_levels) {
 	if (exact_pyramid_levels > 0) {
@@ -201,13 +212,7 @@ float ProcessProblem(const Problem &problem) {
 	// DepthToWeak has now produced the real confidence state. In geometry-aware
 	// mode, only locally planar high-confidence pixels are frozen, so depth
 	// discontinuities remain active for finer pyramid levels.
-	Camera reference_camera;
-	const path reference_cam_path = problem.dense_folder / path("cams") /
-		path(ToFormatIndex(problem.ref_image_id) + "_cam.txt");
-	if (!ReadCamera(reference_cam_path, reference_camera))
-		throw std::runtime_error("Cannot read reference camera: " + reference_cam_path.string());
-	DPE.UpdateAdaptiveMaskFromConfidence(pixel_states, confidence_costs, depth, normal,
-		reference_camera);
+	DPE.UpdateAdaptiveMaskFromConfidence();
 	
 	path depth_path = problem.result_folder / path("depths.dmb");
 	WriteBinMat(depth_path, depth);
@@ -273,9 +278,11 @@ int main(int argc, char **argv) {
                      "[--geometric-anchor-cost] "
 					 "[--max-image-size N] "
                      "[--show-medium-result] "
-                     "[--adaptive-refinement] "
+					 "[--adaptive-refinement] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
+					 "[--adaptive-geometry-density] "
+						 "[--regional-adaptive-pyramid] "
 					 "[--adaptive-point-sampling] [--simple-region-stride N] "
 						 "[--plane-fusion] [--plane-sample-stride N] "
 						 "[--min-pyramid-levels N] "
@@ -290,8 +297,9 @@ int main(int argc, char **argv) {
     bool show_medium_result = false;
     bool adaptive_refinement = false;
     int adaptive_refinement_aggressiveness = 1;
-    float adaptive_refinement_early_stop = 0.0f;
-    bool adaptive_geometry_density = false;
+	float adaptive_refinement_early_stop = 0.0f;
+	bool adaptive_geometry_density = false;
+	bool regional_adaptive_pyramid = false;
     bool adaptive_point_sampling = false;
     int simple_region_stride = 2;
     bool plane_fusion = false;
@@ -311,8 +319,9 @@ int main(int argc, char **argv) {
             if (option == "--fuse") fuse_only = true;
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
             else if (option == "--show-medium-result") show_medium_result = true;
-            else if (option == "--adaptive-refinement") adaptive_refinement = true;
-            else if (option == "--adaptive-geometry-density") adaptive_geometry_density = true;
+			else if (option == "--adaptive-refinement") adaptive_refinement = true;
+			else if (option == "--adaptive-geometry-density") adaptive_geometry_density = true;
+			else if (option == "--regional-adaptive-pyramid") regional_adaptive_pyramid = true;
             else if (option == "--adaptive-refinement-aggressiveness" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -379,9 +388,10 @@ int main(int argc, char **argv) {
                 if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
-        if (adaptive_geometry_density) adaptive_refinement = true;
-        if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
-            throw std::invalid_argument("adaptive-refinement-early-stop requires --adaptive-refinement");
+		if (regional_adaptive_pyramid) adaptive_geometry_density = true;
+		if (adaptive_geometry_density) adaptive_refinement = true;
+		if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
+			throw std::invalid_argument("adaptive-refinement-early-stop requires --adaptive-refinement");
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
@@ -396,13 +406,18 @@ int main(int argc, char **argv) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
         problem.params.adaptive_refinement = adaptive_refinement;
         problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
-        problem.params.adaptive_geometry_density = adaptive_geometry_density;
+		problem.params.adaptive_geometry_density = adaptive_geometry_density;
+		problem.params.regional_adaptive_pyramid = regional_adaptive_pyramid;
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
 	std::cout << "Adaptive refinement: " << adaptive_refinement << " (aggressiveness "
 		<< adaptive_refinement_aggressiveness << ", early-stop threshold "
 		<< adaptive_refinement_early_stop << ")" << std::endl;
+	std::cout << "Adaptive geometry density: " << adaptive_geometry_density
+		<< " (flat parents freeze complete child regions; one point retained per parent)" << std::endl;
+	std::cout << "Regional adaptive pyramid: " << regional_adaptive_pyramid
+		<< " (compact checkerboard worklists for active detail regions)" << std::endl;
     std::cout << "Adaptive point sampling: " << adaptive_point_sampling
 	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
 	std::cout << "Plane fusion: " << plane_fusion << " (sample stride " << plane_sample_stride << ")" << std::endl;
@@ -536,6 +551,19 @@ int main(int argc, char **argv) {
 				WriteBinMat(problem.result_folder / "adaptive_stability.dmb", state.stability);
 				if (adaptive_geometry_density && !state.density_keep.empty())
 					WriteBinMat(problem.result_folder / "adaptive_density_keep.dmb", state.density_keep);
+			}
+		}
+		const int completed_scale = round_num - 1 - i;
+		for (const auto &problem : problems) {
+			// In high-resolution mode the coarsest edge map is reused as the
+			// low-resolution reference at every finer scale. Keep it until the
+			// final scale has completed; otherwise SupportInitialization reads a
+			// missing cache and uploads an empty edge image.
+			if (i + 1 == round_num) {
+				for (int scale = 0; scale < round_num; ++scale)
+					RemoveScaleCaches(problem, scale);
+			} else if (completed_scale != round_num - 1) {
+				RemoveScaleCaches(problem, completed_scale);
 			}
 		}
 		std::cout << "Round: " << i << " done\n";

@@ -37,6 +37,17 @@ bool ExportPointCloud(const path& point_cloud_path, std::vector<PointList>& poin
 // Separate COLMAP-compatible export; the original DPE.ply writer is unchanged.
 bool ExportFusedPointCloud(const path& point_cloud_path, const std::vector<PointList>& pointcloud);
 
+// Evaluate adaptive freeze candidates in parallel from the PatchMatch buffers
+// that already reside on the GPU. Counter order: newly frozen, strong,
+// low-cost weak, geometry rejected.
+void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
+	const float *costs_cuda, const float4 *plane_hypotheses_cuda,
+	uchar *adaptive_mask_cuda, const int *active_pixel_indices_cuda,
+	int active_pixel_count, int width, int height, const Camera *camera_cuda,
+	float depth_min, float depth_max, bool geometry_check,
+	int min_planar_agreements, float max_normal_angle_degrees,
+	float max_relative_depth_error, int *counters_cuda);
+
 void ExportDepthImagePointCloud(const path& point_cloud_path, const path& image_path, const path& cam_path, cv::Mat& depth, float depth_min, float depth_max);
 
 std::string ToFormatIndex(int index);
@@ -88,6 +99,10 @@ struct DataPassHelper {
 	uchar *adaptive_refinement_mask_cuda;
 	int *active_pixel_indices_cuda;
 	int active_pixel_count;
+	int *active_pixel_indices_black_cuda;
+	int active_pixel_black_count;
+	int *active_pixel_indices_red_cuda;
+	int active_pixel_red_count;
 #ifdef DEBUG_COST_LINE
 	float *weak_ncc_cost_cuda;
 #endif // DEBUG_COST_LINE
@@ -108,10 +123,7 @@ public:
 	float4 GetPlaneHypothesis(int r, int c);
 	cv::Mat GetEdge();
 	cv::Mat GetPixelStates();
-	void UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
-		const cv::Mat &confidence_costs, const cv::Mat &depth,
-		const cv::Mat &normal, const Camera &camera);
-	cv::Mat GetConfidenceCosts();
+	void UpdateAdaptiveMaskFromConfidence();
 	cv::Mat GetSelectedViews();
 	float GetAdaptiveFrozenFraction() const;
 	cv::Mat GetRadiusMap();
@@ -177,6 +189,10 @@ private:
 	uchar *adaptive_refinement_mask_cuda = nullptr;
 	int *active_pixel_indices_cuda = nullptr;
 	int active_pixel_count = 0;
+	int *active_pixel_indices_black_cuda = nullptr;
+	int active_pixel_black_count = 0;
+	int *active_pixel_indices_red_cuda = nullptr;
+	int active_pixel_red_count = 0;
 	// =========================
 	cv::Mat label_host;
 	int *label_cuda;
@@ -185,7 +201,7 @@ private:
 	float *complex_cuda;
 	// cost cuda 
 	float *costs_cuda;
-	cv::Mat confidence_cost_host;
+	int *adaptive_freeze_counters_cuda = nullptr;
 	// =========================
 	// other var
 	// params

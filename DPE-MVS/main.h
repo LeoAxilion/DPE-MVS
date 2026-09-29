@@ -87,6 +87,10 @@ struct PatchMatchParams {
 	// Freeze complete flat parent regions at the next pyramid level and keep
 	// one representative point per frozen region during final fusion.
 	bool adaptive_geometry_density = false;
+	// Compact all checkerboard/active kernels to the unfrozen region. This is
+	// the regional pyramid mode: frozen planar children remain logical leaves
+	// and do not receive PatchMatch work at the finer scale.
+	bool regional_adaptive_pyramid = false;
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
 	float sigma_color = 3.0f;

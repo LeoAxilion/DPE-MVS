@@ -1,7 +1,7 @@
 #include "DPE.h"
 #include <cstdlib>
 
-#define DEBUG_COMPLEX
+// #define DEBUG_COMPLEX  // Only valid when edge processing allocates complex_cuda.
 
 // The compact path launches one thread per active pixel. The ordinary path
 // keeps the original two-dimensional full-image launch.
@@ -17,6 +17,32 @@ __device__ int2 WorkPixel(const DataPassHelper *helper) {
 	}
 	return make_int2(blockIdx.x * blockDim.x + threadIdx.x,
 		blockIdx.y * blockDim.y + threadIdx.y);
+}
+
+// Checkerboard propagation has separate black/red passes. In regional mode
+// each pass receives a compact list containing only active pixels of that
+// color, so frozen planar leaves do not occupy checkerboard threads.
+template <bool Compact, bool Black>
+__device__ int2 WorkPixelCheckerboard(const DataPassHelper *helper) {
+	if (Compact) {
+		const int work_index = blockIdx.x * (blockDim.x * blockDim.y) +
+			threadIdx.y * blockDim.x + threadIdx.x;
+		const int count = Black ? helper->active_pixel_black_count : helper->active_pixel_red_count;
+		if (work_index >= count)
+			return make_int2(helper->width, helper->height);
+		const int *indices = Black ? helper->active_pixel_indices_black_cuda :
+			helper->active_pixel_indices_red_cuda;
+		const int center = indices[work_index];
+		return make_int2(center % helper->width, center / helper->width);
+	}
+	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x,
+		blockIdx.y * blockDim.y + threadIdx.y);
+	if (Black) {
+		p.y = (threadIdx.x % 2 == 0) ? p.y * 2 : p.y * 2 + 1;
+	} else {
+		p.y = (threadIdx.x % 2 == 0) ? p.y * 2 + 1 : p.y * 2;
+	}
+	return p;
 }
 
 __device__  void sort_small(float *d, const int n)
@@ -1908,16 +1934,10 @@ __device__ void CheckerboardPropagationWeak(
 	}
 }
 
+template <bool Compact>
 __global__ void BlackPixelUpdateWeak(const int iter, DataPassHelper *helper)
 {
-	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-
-	if (threadIdx.x % 2 == 0) {
-		p.y = p.y * 2;
-	}
-	else {
-		p.y = p.y * 2 + 1;
-	}
+	int2 p = WorkPixelCheckerboard<Compact, true>(helper);
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
@@ -1928,16 +1948,10 @@ __global__ void BlackPixelUpdateWeak(const int iter, DataPassHelper *helper)
 	}
 }
 
+template <bool Compact>
 __global__ void RedPixelUpdateWeak(const int iter, DataPassHelper *helper)
 {
-	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-
-	if (threadIdx.x % 2 == 0) {
-		p.y = p.y * 2 + 1;
-	}
-	else {
-		p.y = p.y * 2;
-	}
+	int2 p = WorkPixelCheckerboard<Compact, false>(helper);
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
@@ -1948,16 +1962,10 @@ __global__ void RedPixelUpdateWeak(const int iter, DataPassHelper *helper)
 	}
 }
 
+template <bool Compact>
 __global__ void BlackPixelUpdateStrong(const int iter, DataPassHelper *helper)
 {
-	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-
-	if (threadIdx.x % 2 == 0) {
-		p.y = p.y * 2;
-	}
-	else {
-		p.y = p.y * 2 + 1;
-	}
+	int2 p = WorkPixelCheckerboard<Compact, true>(helper);
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
@@ -1970,16 +1978,10 @@ __global__ void BlackPixelUpdateStrong(const int iter, DataPassHelper *helper)
 	CheckerboardPropagationStrong(p, iter, helper);
 }
 
+template <bool Compact>
 __global__ void RedPixelUpdateStrong(const int iter, DataPassHelper *helper)
 {
-	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-
-	if (threadIdx.x % 2 == 0) {
-		p.y = p.y * 2 + 1;
-	}
-	else {
-		p.y = p.y * 2;
-	}
+	int2 p = WorkPixelCheckerboard<Compact, false>(helper);
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
@@ -1992,10 +1994,11 @@ __global__ void RedPixelUpdateStrong(const int iter, DataPassHelper *helper)
 	CheckerboardPropagationStrong(p, iter, helper);
 }
 
+template <bool Compact>
 __global__ void GetDepthandNormal(
 	DataPassHelper *helper
 ) {
-	const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 p = WorkPixel<Compact>(helper);
 	Camera *cameras = helper->cameras_cuda;
 	float4 *plane_hypotheses = helper->plane_hypotheses_cuda;
 	const int width = helper->width;;
@@ -2121,15 +2124,10 @@ __device__ void CheckerboardFilterStrong(
 	}
 }
 
+template <bool Compact>
 __global__ void BlackPixelFilterStrong(DataPassHelper *helper)
 {
-	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-	if (threadIdx.x % 2 == 0) {
-		p.y = p.y * 2;
-	}
-	else {
-		p.y = p.y * 2 + 1;
-	}
+	int2 p = WorkPixelCheckerboard<Compact, true>(helper);
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
@@ -2140,15 +2138,10 @@ __global__ void BlackPixelFilterStrong(DataPassHelper *helper)
 	}
 }
 
+template <bool Compact>
 __global__ void RedPixelFilterStrong(DataPassHelper *helper)
 {
-	int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-	if (threadIdx.x % 2 == 0) {
-		p.y = p.y * 2 + 1;
-	}
-	else {
-		p.y = p.y * 2;
-	}
+	int2 p = WorkPixelCheckerboard<Compact, false>(helper);
 	if (p.x >= helper->width || p.y >= helper->height) {
 		return;
 	}
@@ -2547,10 +2540,11 @@ __global__ void NeigbourUpdate(
 	}
 }
 
+template <bool Compact>
 __global__ void GenEdgeInform(
 	DataPassHelper *helper
 ) {
-	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
 	const int width = helper->width;
 	const int height = helper->height;
 	if (point.x >= width || point.y >= height) {
@@ -2658,8 +2652,9 @@ __global__ void GenEdgeInform(
 	}
 }
 
+template <bool Compact>
 __global__ void DepthToWeak(DataPassHelper *helper) {
-	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
 	const int width = helper->width;
 	const int height = helper->height;
 	if (point.x >= width || point.y >= height) {
@@ -3202,6 +3197,132 @@ __global__ void RANSACToGetFitPlane(DataPassHelper *helper) {
 	
 }
 
+namespace {
+__device__ inline bool AdaptiveFinite(const float value) {
+	return (__float_as_uint(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+__device__ bool AdaptiveGeometryStable(const float4 *planes, int width, int height,
+	int row, int col, const Camera &camera, int min_agreements,
+	float max_normal_angle_degrees, float max_relative_depth_error) {
+	if (row < 1 || col < 1 || row + 1 >= height || col + 1 >= width) return false;
+	const float4 center = planes[row * width + col];
+	const float z0 = center.w;
+	float n0x = center.x, n0y = center.y, n0z = center.z;
+	const float n0_length = sqrtf(n0x * n0x + n0y * n0y + n0z * n0z);
+	if (!AdaptiveFinite(z0) || z0 <= 0.0f || !AdaptiveFinite(n0_length) || n0_length < 1e-6f)
+		return false;
+	n0x /= n0_length;
+	n0y /= n0_length;
+	n0z /= n0_length;
+	const float n0cx = camera.R[0] * n0x + camera.R[1] * n0y + camera.R[2] * n0z;
+	const float n0cy = camera.R[3] * n0x + camera.R[4] * n0y + camera.R[5] * n0z;
+	const float n0cz = camera.R[6] * n0x + camera.R[7] * n0y + camera.R[8] * n0z;
+	const float plane_constant = z0 * (n0cx * (col - camera.K[2]) / camera.K[0] +
+		n0cy * (row - camera.K[5]) / camera.K[4] + n0cz);
+	if (!AdaptiveFinite(plane_constant) || fabsf(plane_constant) < 1e-8f) return false;
+	const float cosine_threshold = cosf(max_normal_angle_degrees * 0.017453292519943295f);
+	int agreements = 0;
+	for (int dy = -1; dy <= 1; ++dy) {
+		for (int dx = -1; dx <= 1; ++dx) {
+			if (dx == 0 && dy == 0) continue;
+			const int neighbor_row = row + dy;
+			const int neighbor_col = col + dx;
+			const float4 neighbor = planes[neighbor_row * width + neighbor_col];
+			const float zn = neighbor.w;
+			float nnx = neighbor.x, nny = neighbor.y, nnz = neighbor.z;
+			const float nn_length = sqrtf(nnx * nnx + nny * nny + nnz * nnz);
+			if (!AdaptiveFinite(zn) || zn <= 0.0f || !AdaptiveFinite(nn_length) || nn_length < 1e-6f)
+				continue;
+			nnx /= nn_length;
+			nny /= nn_length;
+			nnz /= nn_length;
+			const float normal_cosine = n0x * nnx + n0y * nny + n0z * nnz;
+			if (!AdaptiveFinite(normal_cosine) || fabsf(normal_cosine) < cosine_threshold) continue;
+			const float ray_dot = n0cx * (neighbor_col - camera.K[2]) / camera.K[0] +
+				n0cy * (neighbor_row - camera.K[5]) / camera.K[4] + n0cz;
+			if (!AdaptiveFinite(ray_dot) || fabsf(ray_dot) < 1e-6f) continue;
+			const float predicted = plane_constant / ray_dot;
+			if (!AdaptiveFinite(predicted) || predicted <= 0.0f) continue;
+			const float relative_error = fabsf(predicted - zn) / zn;
+			if (!AdaptiveFinite(relative_error) || relative_error > max_relative_depth_error) continue;
+			++agreements;
+		}
+	}
+	return agreements >= min_agreements;
+}
+
+template <bool Compact>
+__global__ void AdaptiveFreezeMaskKernel(const uchar *pixel_states,
+	const float *costs, const float4 *planes, uchar *adaptive_mask,
+	const int *active_pixel_indices, int active_pixel_count,
+	int width, int height, const Camera *camera, float depth_min, float depth_max,
+	bool geometry_check, int min_planar_agreements, float max_normal_angle_degrees,
+	float max_relative_depth_error, int *counters) {
+	__shared__ int block_counters[4];
+	if (threadIdx.x < 4) block_counters[threadIdx.x] = 0;
+	__syncthreads();
+	const int work_index = blockIdx.x * blockDim.x + threadIdx.x;
+	const int length = width * height;
+	int index = work_index;
+	bool in_range = work_index < length;
+	if (Compact) {
+		in_range = work_index < active_pixel_count;
+		if (in_range) index = active_pixel_indices[work_index];
+	}
+	// Frozen pixels are terminal states: when a dense launch is needed, exit
+	// before loading confidence/geometry; compact launches omit them entirely.
+	if (in_range && adaptive_mask[index] != 0) {
+		uchar state = pixel_states[index];
+		const float4 plane = planes[index];
+		// Match ProcessProblem's existing depth-range rejection before confidence
+		// classification. NaNs remain unchanged here, as they do in its comparisons.
+		if (plane.w < depth_min || plane.w > depth_max) state = UNKNOWN;
+		const bool strong = state == STRONG;
+		const bool weak_low_cost = state == WEAK && AdaptiveFinite(costs[index]) && costs[index] <= 0.15f;
+		bool geometry_stable = true;
+		if (geometry_check && (strong || weak_low_cost)) {
+			geometry_stable = AdaptiveGeometryStable(planes, width, height,
+				index / width, index % width, camera[0], min_planar_agreements,
+				max_normal_angle_degrees, max_relative_depth_error);
+			if (!geometry_stable) atomicAdd(&block_counters[3], 1);
+		}
+		if (adaptive_mask[index] != 0 && (strong || weak_low_cost) && geometry_stable) {
+			adaptive_mask[index] = 0;
+			atomicAdd(&block_counters[0], 1);
+			atomicAdd(&block_counters[strong ? 1 : 2], 1);
+		}
+	}
+	__syncthreads();
+	if (threadIdx.x < 4 && block_counters[threadIdx.x] != 0)
+		atomicAdd(&counters[threadIdx.x], block_counters[threadIdx.x]);
+}
+}
+
+void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
+	const float *costs_cuda, const float4 *plane_hypotheses_cuda,
+	uchar *adaptive_mask_cuda, const int *active_pixel_indices_cuda,
+	int active_pixel_count, int width, int height, const Camera *camera_cuda,
+	float depth_min, float depth_max, bool geometry_check,
+	int min_planar_agreements, float max_normal_angle_degrees,
+	float max_relative_depth_error, int *counters_cuda) {
+	const int length = width * height;
+	if (active_pixel_indices_cuda && active_pixel_count < length) {
+		if (active_pixel_count <= 0) return;
+		AdaptiveFreezeMaskKernel<true><<<(active_pixel_count + 255) / 256, 256>>>(
+			pixel_states_cuda, costs_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
+			active_pixel_indices_cuda, active_pixel_count, width, height, camera_cuda,
+			depth_min, depth_max, geometry_check, min_planar_agreements,
+			max_normal_angle_degrees, max_relative_depth_error, counters_cuda);
+	} else {
+		AdaptiveFreezeMaskKernel<false><<<(length + 255) / 256, 256>>>(
+			pixel_states_cuda, costs_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
+			nullptr, length, width, height, camera_cuda, depth_min, depth_max,
+			geometry_check, min_planar_agreements, max_normal_angle_degrees,
+			max_relative_depth_error, counters_cuda);
+	}
+}
+
 void DPE::RunPatchMatch() {
 	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
@@ -3228,9 +3349,16 @@ void DPE::RunPatchMatch() {
 	const bool use_active_worklist = params_host.adaptive_refinement &&
 		active_pixel_count < width * height;
 	dim3 grid_size_active((active_pixel_count + 255) / 256, 1, 1);
+	const bool use_compact_checkerboard = use_active_worklist &&
+		params_host.regional_adaptive_pyramid;
+	dim3 grid_size_active_black((active_pixel_black_count + 255) / 256, 1, 1);
+	dim3 grid_size_active_red((active_pixel_red_count + 255) / 256, 1, 1);
 	if (use_active_worklist)
 		std::cout << "Active-pixel worklist: " << active_pixel_count << " / "
 			<< width * height << " pixels\n";
+	if (use_compact_checkerboard)
+		std::cout << "Regional checkerboard worklists: black " << active_pixel_black_count
+			<< ", red " << active_pixel_red_count << " pixels\n";
 
 	dim3 grid_size_half;
 	grid_size_half.x = (width + BLOCK_W - 1) / BLOCK_W;
@@ -3244,7 +3372,12 @@ void DPE::RunPatchMatch() {
 	InitRandomStates << <grid_size_full, block_size_full >> >(helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	GenEdgeInform << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_compact_checkerboard) {
+		if (active_pixel_count > 0)
+			GenEdgeInform<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else {
+		GenEdgeInform<false> << <grid_size_full, block_size_full >> > (helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 #ifdef DEBUG_COMPLEX
 	path complex_path = problem.result_folder / path("complex.jpg");
@@ -3256,7 +3389,12 @@ void DPE::RunPatchMatch() {
 	cv::imwrite(complex_path.string(), visual_complex_mat);
 #endif
 
-	FindNearestStrongPoint << <grid_size_full, block_size_full >> >(helper_cuda);
+	if (use_compact_checkerboard) {
+		if (active_pixel_count > 0)
+			FindNearestStrongPoint<true> << <grid_size_active, block_size_full >> >(helper_cuda);
+	} else {
+		FindNearestStrongPoint<false> << <grid_size_full, block_size_full >> >(helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	profile_stage("preparation");
 
@@ -3296,14 +3434,26 @@ void DPE::RunPatchMatch() {
 	std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 	std::cout << "Generate neighbours done. Cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
 	profile_stage("neighbours");
-	RandomInitialization << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_compact_checkerboard) {
+		cudaMemset(costs_cuda, 0, sizeof(float) * width * height);
+		if (active_pixel_count > 0)
+			RandomInitialization<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else {
+		RandomInitialization<false> << <grid_size_full, block_size_full >> > (helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	profile_stage("initialization");
 
 	for (int i = 0; i < params_host.max_iterations; ++i) {
-		BlackPixelUpdateStrong << <grid_size_half, block_size_half >> > (i, helper_cuda);
-		CUDA_SAFE_CALL(cudaDeviceSynchronize());
-		RedPixelUpdateStrong << <grid_size_half, block_size_half >> > (i, helper_cuda);
+		if (use_compact_checkerboard) {
+			if (active_pixel_black_count > 0)
+				BlackPixelUpdateStrong<true> << <grid_size_active_black, block_size_full >> > (i, helper_cuda);
+			if (active_pixel_red_count > 0)
+				RedPixelUpdateStrong<true> << <grid_size_active_red, block_size_full >> > (i, helper_cuda);
+		} else {
+			BlackPixelUpdateStrong<false> << <grid_size_half, block_size_half >> > (i, helper_cuda);
+			RedPixelUpdateStrong<false> << <grid_size_half, block_size_half >> > (i, helper_cuda);
+		}
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Iteration " << i << " strong done\n";
 		profile_stage("strong propagation");
@@ -3315,24 +3465,46 @@ void DPE::RunPatchMatch() {
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Compute normal done\n";
 		profile_stage("plane fitting");
-		BlackPixelUpdateWeak << <grid_size_half, block_size_half >> > (i, helper_cuda);
-		CUDA_SAFE_CALL(cudaDeviceSynchronize());
-		RedPixelUpdateWeak << <grid_size_half, block_size_half >> > (i, helper_cuda);
+		if (use_compact_checkerboard) {
+			if (active_pixel_black_count > 0)
+				BlackPixelUpdateWeak<true> << <grid_size_active_black, block_size_full >> > (i, helper_cuda);
+			if (active_pixel_red_count > 0)
+				RedPixelUpdateWeak<true> << <grid_size_active_red, block_size_full >> > (i, helper_cuda);
+		} else {
+			BlackPixelUpdateWeak<false> << <grid_size_half, block_size_half >> > (i, helper_cuda);
+			RedPixelUpdateWeak<false> << <grid_size_half, block_size_half >> > (i, helper_cuda);
+		}
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		std::cout << "Iteration " << i << " -weak- done\n";
 		profile_stage("weak propagation");
 	}
 	
-	GetDepthandNormal << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_compact_checkerboard) {
+		if (active_pixel_count > 0)
+			GetDepthandNormal<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else {
+		GetDepthandNormal<false> << <grid_size_full, block_size_full >> > (helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-	BlackPixelFilterStrong << <grid_size_half, block_size_half >> > (helper_cuda);
-	CUDA_SAFE_CALL(cudaDeviceSynchronize());
-	RedPixelFilterStrong << <grid_size_half, block_size_half >> > (helper_cuda);
+	if (use_compact_checkerboard) {
+		if (active_pixel_black_count > 0)
+			BlackPixelFilterStrong<true> << <grid_size_active_black, block_size_full >> > (helper_cuda);
+		if (active_pixel_red_count > 0)
+			RedPixelFilterStrong<true> << <grid_size_active_red, block_size_full >> > (helper_cuda);
+	} else {
+		BlackPixelFilterStrong<false> << <grid_size_half, block_size_half >> > (helper_cuda);
+		RedPixelFilterStrong<false> << <grid_size_half, block_size_half >> > (helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	profile_stage("filtering");
 
-	DepthToWeak << <grid_size_full, block_size_full >> > (helper_cuda);
+	if (use_compact_checkerboard) {
+		if (active_pixel_count > 0)
+			DepthToWeak<true> << <grid_size_active, block_size_full >> > (helper_cuda);
+	} else {
+		DepthToWeak<false> << <grid_size_full, block_size_full >> > (helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 	profile_stage("confidence");
 
@@ -3342,14 +3514,6 @@ void DPE::RunPatchMatch() {
 	} else
 		LocalRefine<false> << <grid_size_full, block_size_full >> > (helper_cuda);
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
-	if (params_host.adaptive_refinement) {
-		// costs_cuda is updated by weak checkerboard propagation after candidate
-		// anchor planes have been evaluated. Use that post-anchor PatchMatch cost
-		// for the optional low-cost WEAK freeze decision.
-		confidence_cost_host.create(height, width, CV_32FC1);
-		cudaMemcpy(confidence_cost_host.ptr<float>(0), costs_cuda,
-			width * height * sizeof(float), cudaMemcpyDeviceToHost);
-	}
 	profile_stage("local refinement");
 #ifdef DEBUG_COST_LINE
 	{
