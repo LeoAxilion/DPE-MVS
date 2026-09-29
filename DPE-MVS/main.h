@@ -84,6 +84,9 @@ struct PatchMatchParams {
 	bool geometric_anchor_cost = false; // Opt-in experimental replacement of anchor NCC.
 	bool adaptive_refinement = false; // Skip fine-scale PatchMatch updates on stable planar strong pixels.
 	int adaptive_refinement_aggressiveness = 1; // 1=conservative, 2=balanced, 3=aggressive planar consensus.
+	// Freeze complete flat parent regions at the next pyramid level and keep
+	// one representative point per frozen region during final fusion.
+	bool adaptive_geometry_density = false;
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
 	float sigma_color = 3.0f;
@@ -115,6 +118,8 @@ struct PatchMatchParams {
 struct AdaptiveRefinementState {
 	cv::Mat mask;
 	cv::Mat stability;
+	// One representative sample per frozen parent region at the output scale.
+	cv::Mat density_keep;
 };
 
 struct Problem {
@@ -127,6 +132,9 @@ struct Problem {
 	PatchMatchParams params;
 	bool show_medium_result;
 	int iteration;
+	// Geometry-aware density mode updates its mask only at the end of a scale;
+	// the final scale keeps the inherited mask for sparse fusion sampling.
+	bool update_adaptive_mask = true;
 	// Shared by successive DPE instances for this image; checkpointed per scale.
 	std::shared_ptr<AdaptiveRefinementState> adaptive_state =
 		std::make_shared<AdaptiveRefinementState>();

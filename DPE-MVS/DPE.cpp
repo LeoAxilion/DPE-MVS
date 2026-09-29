@@ -73,6 +73,72 @@ cv::Mat PropagateFrozenMask(const cv::Mat &source, const cv::Size &target_size) 
 	return target;
 }
 
+// Geometry-aware density mode freezes every child of a stable parent region.
+// This is deliberately separate from the legacy representative-only mask:
+// the latter preserves fine-scale work around a frozen pixel, while this mode
+// is intended to stop upsampling across an entire locally planar footprint.
+cv::Mat PropagateFrozenRegionMask(const cv::Mat &source, const cv::Size &target_size) {
+	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
+	if (target_size.width <= source.cols && target_size.height <= source.rows) {
+		cv::Mat target;
+		cv::resize(source, target, target_size, 0, 0, cv::INTER_NEAREST);
+		return target;
+	}
+	cv::Mat target(target_size, CV_8UC1, cv::Scalar(1));
+	for (int y = 0; y < source.rows; ++y) {
+		const uchar *source_row = source.ptr<uchar>(y);
+		const int target_y_begin = y * target.rows / source.rows;
+		const int target_y_end = std::min(target.rows,
+			((y + 1) * target.rows + source.rows - 1) / source.rows);
+		for (int x = 0; x < source.cols; ++x) {
+			if (source_row[x] != 0) continue;
+			const int target_x_begin = x * target.cols / source.cols;
+			const int target_x_end = std::min(target.cols,
+				((x + 1) * target.cols + source.cols - 1) / source.cols);
+			for (int ty = target_y_begin; ty < std::max(target_y_begin + 1, target_y_end); ++ty) {
+				uchar *target_row = target.ptr<uchar>(std::min(ty, target.rows - 1));
+				for (int tx = target_x_begin; tx < std::max(target_x_begin + 1, target_x_end); ++tx)
+					target_row[std::min(tx, target.cols - 1)] = 0;
+			}
+		}
+	}
+	return target;
+}
+
+// Keep one sample at the representative coordinate of every frozen parent
+// while dropping its other children from final fusion. Active parents keep all
+// of their children, so depth discontinuities retain their dense samples.
+cv::Mat PropagateDensityKeepMask(const cv::Mat &source, const cv::Size &target_size) {
+	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
+	if (target_size.width <= source.cols && target_size.height <= source.rows) {
+		cv::Mat target;
+		cv::resize(source, target, target_size, 0, 0, cv::INTER_NEAREST);
+		return target;
+	}
+	cv::Mat target(target_size, CV_8UC1, cv::Scalar(1));
+	for (int y = 0; y < source.rows; ++y) {
+		const uchar *source_row = source.ptr<uchar>(y);
+		const int target_y_begin = y * target.rows / source.rows;
+		const int target_y_end = std::min(target.rows,
+			((y + 1) * target.rows + source.rows - 1) / source.rows);
+		for (int x = 0; x < source.cols; ++x) {
+			if (source_row[x] != 0) continue;
+			const int target_x_begin = x * target.cols / source.cols;
+			const int target_x_end = std::min(target.cols,
+				((x + 1) * target.cols + source.cols - 1) / source.cols);
+			for (int ty = target_y_begin; ty < std::max(target_y_begin + 1, target_y_end); ++ty) {
+				uchar *target_row = target.ptr<uchar>(std::min(ty, target.rows - 1));
+				for (int tx = target_x_begin; tx < std::max(target_x_begin + 1, target_x_end); ++tx)
+					target_row[std::min(tx, target.cols - 1)] = 0;
+			}
+			const int representative_x = RepresentativeCoordinate(x, source.cols, target.cols);
+			const int representative_y = RepresentativeCoordinate(y, source.rows, target.rows);
+			target.at<uchar>(representative_y, representative_x) = 1;
+		}
+	}
+	return target;
+}
+
 // Stability belongs to the tested pixel, not to every pixel interpolated from it.
 cv::Mat PropagateStabilityCount(const cv::Mat &source, const cv::Size &target_size) {
 	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
@@ -1265,9 +1331,11 @@ void DPE::SupportInitialization() {
 		profile_start = now;
 	};
 	adaptive_refinement_mask_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(1));
+	adaptive_density_keep_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(1));
 	cv::Mat adaptive_stability_count_host = cv::Mat::zeros(height, width, CV_8UC1);
 	const path adaptive_mask_path = problem.result_folder / path("adaptive_frozen.dmb");
 	const path adaptive_stability_path = problem.result_folder / path("adaptive_stability.dmb");
+	const path adaptive_density_keep_path = problem.result_folder / path("adaptive_density_keep.dmb");
 	auto &adaptive_state = *problem.adaptive_state;
 	if (problem.params.state == FIRST_INIT) adaptive_state = AdaptiveRefinementState();
 	if (problem.params.state != FIRST_INIT) {
@@ -1277,17 +1345,42 @@ void DPE::SupportInitialization() {
 		if (!previous_mask.empty() && previous_mask.type() == CV_8UC1) {
 			if (previous_mask.size() != adaptive_refinement_mask_host.size()) {
 				const int previous_frozen = previous_mask.total() - cv::countNonZero(previous_mask);
-				adaptive_refinement_mask_host = PropagateFrozenMask(previous_mask, adaptive_refinement_mask_host.size());
+				adaptive_refinement_mask_host = problem.params.adaptive_geometry_density
+					? PropagateFrozenRegionMask(previous_mask, adaptive_refinement_mask_host.size())
+					: PropagateFrozenMask(previous_mask, adaptive_refinement_mask_host.size());
 				const int inherited_frozen = adaptive_refinement_mask_host.total() -
 					cv::countNonZero(adaptive_refinement_mask_host);
 				std::cout << "Adaptive freeze propagation: " << previous_mask.cols << "x" << previous_mask.rows
 					<< " (" << previous_frozen << " frozen) -> " << adaptive_refinement_mask_host.cols << "x"
 					<< adaptive_refinement_mask_host.rows << " (" << inherited_frozen
-					<< " frozen; one representative per frozen parent)\n";
+					<< " frozen"
+					<< (problem.params.adaptive_geometry_density
+						? "; complete frozen parent regions)\n"
+						: "; one representative per frozen parent)\n");
 			} else {
 				adaptive_refinement_mask_host = previous_mask;
 			}
 		}
+	}
+	if (problem.params.adaptive_geometry_density) {
+		cv::Mat previous_density_keep = adaptive_state.density_keep;
+		if (previous_density_keep.empty() && exists(adaptive_density_keep_path))
+			ReadBinMat(adaptive_density_keep_path, previous_density_keep);
+		if (!previous_density_keep.empty() && previous_density_keep.type() == CV_8UC1) {
+			if (previous_density_keep.size() != adaptive_density_keep_host.size()) {
+				cv::Mat previous_mask = adaptive_state.mask;
+				if (previous_mask.empty() && exists(adaptive_mask_path)) ReadBinMat(adaptive_mask_path, previous_mask);
+				if (!previous_mask.empty() && previous_mask.type() == CV_8UC1)
+					adaptive_density_keep_host = PropagateDensityKeepMask(previous_mask,
+						adaptive_density_keep_host.size());
+				else
+					adaptive_density_keep_host = PropagateDensityKeepMask(previous_density_keep,
+						adaptive_density_keep_host.size());
+			} else {
+				adaptive_density_keep_host = previous_density_keep;
+			}
+		}
+		adaptive_state.density_keep = adaptive_density_keep_host;
 	}
 	if (problem.params.state != FIRST_INIT) {
 		cv::Mat previous_stability_count = adaptive_state.stability;
@@ -1367,16 +1460,24 @@ cv::Mat DPE::GetConfidenceCosts() {
 }
 
 void DPE::UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
-	const cv::Mat &confidence_costs) {
+	const cv::Mat &confidence_costs, const cv::Mat &depth,
+	const cv::Mat &normal, const Camera &camera) {
 	if (!problem.params.adaptive_refinement || pixel_states.empty() ||
 		pixel_states.size() != adaptive_refinement_mask_host.size() ||
 		confidence_costs.empty() || confidence_costs.size() != pixel_states.size() ||
-		confidence_costs.type() != CV_32FC1) return;
+		confidence_costs.type() != CV_32FC1 || !problem.update_adaptive_mask) return;
 	AdaptiveRefinementState &state = *problem.adaptive_state;
 	constexpr float kWeakFreezeCostThreshold = 0.15f;
 	int newly_frozen = 0;
 	int newly_frozen_strong = 0;
 	int newly_frozen_weak_low_cost = 0;
+	int geometry_rejected = 0;
+	const int min_planar_agreements = problem.params.adaptive_refinement_aggressiveness >= 3 ? 6 :
+		(problem.params.adaptive_refinement_aggressiveness == 2 ? 7 : 8);
+	const float max_normal_angle = problem.params.adaptive_refinement_aggressiveness >= 3 ? 20.0f :
+		(problem.params.adaptive_refinement_aggressiveness == 2 ? 16.0f : 12.0f);
+	const float max_relative_depth_error = problem.params.adaptive_refinement_aggressiveness >= 3 ? 0.02f :
+		(problem.params.adaptive_refinement_aggressiveness == 2 ? 0.016f : 0.0125f);
 	for (int r = 0; r < pixel_states.rows; ++r) {
 		const uchar *state_row = pixel_states.ptr<uchar>(r);
 		const float *cost_row = confidence_costs.ptr<float>(r);
@@ -1386,7 +1487,13 @@ void DPE::UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
 			const bool strong = state_row[c] == STRONG;
 			const bool weak_low_cost = state_row[c] == WEAK &&
 				IsFiniteFloat(cost_row[c]) && cost_row[c] <= kWeakFreezeCostThreshold;
-			if (mask_row[c] != 0 && (strong || weak_low_cost)) {
+			bool geometry_stable = true;
+			if (problem.params.adaptive_geometry_density && (strong || weak_low_cost)) {
+				geometry_stable = IsStablePlanarNeighbourhood(depth, normal, cv::Mat(), camera, r, c,
+					min_planar_agreements, max_normal_angle, max_relative_depth_error);
+				if (!geometry_stable) ++geometry_rejected;
+			}
+			if (mask_row[c] != 0 && (strong || weak_low_cost) && geometry_stable) {
 				mask_row[c] = 0;
 				stability_row[c] = 1;
 				++newly_frozen;
@@ -1401,7 +1508,10 @@ void DPE::UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
 	std::cout << "Adaptive confidence freeze: " << newly_frozen << " newly frozen ("
 		<< newly_frozen_strong << " strong, " << newly_frozen_weak_low_cost
 		<< " weak cost <= " << kWeakFreezeCostThreshold << "), "
-		<< (100.0f * adaptive_frozen_fraction) << "% total" << std::endl;
+		<< (100.0f * adaptive_frozen_fraction) << "% total";
+	if (problem.params.adaptive_geometry_density)
+		std::cout << "; geometry rejected " << geometry_rejected << " high-confidence pixels";
+	std::cout << std::endl;
 }
 
 cv::Mat DPE::GetSelectedViews() {
@@ -1674,7 +1784,7 @@ PlanePatchMap BuildPlanePatchMap(const cv::Mat &depth, const cv::Mat &normal,
 
 // ETH version
 void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride,
-		bool plane_fusion, int plane_sample_stride)
+		bool plane_fusion, int plane_sample_stride, bool adaptive_geometry_density)
 {
 	if (simple_region_stride < 1) throw std::invalid_argument("simple_region_stride must be >= 1");
 	if (plane_sample_stride < 1) throw std::invalid_argument("plane_sample_stride must be >= 1");
@@ -1689,6 +1799,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	std::vector<cv::Mat> masks;
 	std::vector<cv::Mat> blocks;
 	std::vector<cv::Mat> weaks;
+	std::vector<cv::Mat> density_keeps;
 	images.clear();
 	cameras.clear();
 	depths.clear();
@@ -1696,6 +1807,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	masks.clear();
 	blocks.clear();
 	weaks.clear();
+	density_keeps.clear();
 	std::unordered_map<int, int> imageIdToindexMap;
 
 	path block_folder = dense_folder / path("blocks");
@@ -1721,6 +1833,17 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 		ReadBinMat(depth_path, depth);
 		ReadBinMat(normal_path, normal);
 		ReadBinMat(weak_path, weak);
+		if (adaptive_geometry_density) {
+			const path density_keep_path = problem.result_folder / path("adaptive_density_keep.dmb");
+			cv::Mat density_keep;
+			if (!ReadBinMat(density_keep_path, density_keep) || density_keep.type() != CV_8UC1)
+				throw std::runtime_error("Missing or invalid adaptive density mask: " + density_keep_path.string());
+			if (density_keep.size() != depth.size())
+				cv::resize(density_keep, density_keep, depth.size(), 0, 0, cv::INTER_NEAREST);
+			density_keeps.emplace_back(std::move(density_keep));
+		} else {
+			density_keeps.emplace_back();
+		}
 	
 		if (use_block) {
 			path block_path = block_folder / path("mask_" + std::to_string(problem.ref_image_id) + ".jpg");
@@ -1983,6 +2106,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	PointCloud.clear();
 	uint64_t simple_candidates = 0;
 	uint64_t simple_points_skipped = 0;
+	uint64_t density_pixels_skipped = 0;
 
 	for (int i = 0; i < num_images; ++i) {
 		std::cout << "Fusing image " << std::setw(8) << std::setfill('0') << i << "..." << std::endl;
@@ -1993,6 +2117,10 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 		int num_ngb = problem.src_image_ids.size();
 		for (int r = 0; r < rows; ++r) {
 			for (int c = 0; c < cols; ++c) {
+				if (adaptive_geometry_density && density_keeps[ref_index].at<uchar>(r, c) == 0) {
+					++density_pixels_skipped;
+					continue;
+				}
 				if (use_block && blocks[ref_index].at<uchar>(r, c) < 128) {
 					continue;
 				}
@@ -2089,6 +2217,10 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 		std::cout << "Adaptive point sampling (stride " << simple_region_stride << "): skipped "
 			<< simple_points_skipped << " planar pixels / " << simple_candidates << " off-grid pixels checked ("
 			<< (100.0 * simple_points_skipped / std::max<uint64_t>(1, simple_candidates)) << "%)." << std::endl;
+	}
+	if (adaptive_geometry_density) {
+		std::cout << "Geometry-aware density fusion skipped " << density_pixels_skipped
+			<< " child pixels; retained one representative for frozen planar parents." << std::endl;
 	}
 }
 

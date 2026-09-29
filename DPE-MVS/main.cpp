@@ -187,10 +187,6 @@ float ProcessProblem(const Problem &problem) {
 	cv::Mat normal = cv::Mat(height, width, CV_32FC3);
 	cv::Mat pixel_states = DPE.GetPixelStates();
 	cv::Mat confidence_costs = DPE.GetConfidenceCosts();
-	// DepthToWeak has now produced the real confidence state. Freeze STRONG
-	// pixels and low-cost WEAK pixels here so the initial scale is also eligible
-	// without using its temporary all-STRONG initialization state.
-	DPE.UpdateAdaptiveMaskFromConfidence(pixel_states, confidence_costs);
 	for (int r = 0; r < height; ++r) {
 		for (int c = 0; c < width; ++c) {
 			float4 plane_hypothesis = DPE.GetPlaneHypothesis(r, c);
@@ -202,6 +198,16 @@ float ProcessProblem(const Problem &problem) {
 			normal.at<cv::Vec3f>(r, c) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
 		}
 	}
+	// DepthToWeak has now produced the real confidence state. In geometry-aware
+	// mode, only locally planar high-confidence pixels are frozen, so depth
+	// discontinuities remain active for finer pyramid levels.
+	Camera reference_camera;
+	const path reference_cam_path = problem.dense_folder / path("cams") /
+		path(ToFormatIndex(problem.ref_image_id) + "_cam.txt");
+	if (!ReadCamera(reference_cam_path, reference_camera))
+		throw std::runtime_error("Cannot read reference camera: " + reference_cam_path.string());
+	DPE.UpdateAdaptiveMaskFromConfidence(pixel_states, confidence_costs, depth, normal,
+		reference_camera);
 	
 	path depth_path = problem.result_folder / path("depths.dmb");
 	WriteBinMat(depth_path, depth);
@@ -285,6 +291,7 @@ int main(int argc, char **argv) {
     bool adaptive_refinement = false;
     int adaptive_refinement_aggressiveness = 1;
     float adaptive_refinement_early_stop = 0.0f;
+    bool adaptive_geometry_density = false;
     bool adaptive_point_sampling = false;
     int simple_region_stride = 2;
     bool plane_fusion = false;
@@ -305,6 +312,7 @@ int main(int argc, char **argv) {
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
             else if (option == "--show-medium-result") show_medium_result = true;
             else if (option == "--adaptive-refinement") adaptive_refinement = true;
+            else if (option == "--adaptive-geometry-density") adaptive_geometry_density = true;
             else if (option == "--adaptive-refinement-aggressiveness" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -371,6 +379,7 @@ int main(int argc, char **argv) {
                 if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
+        if (adaptive_geometry_density) adaptive_refinement = true;
         if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
             throw std::invalid_argument("adaptive-refinement-early-stop requires --adaptive-refinement");
     } catch (const std::exception &e) {
@@ -387,6 +396,7 @@ int main(int argc, char **argv) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
         problem.params.adaptive_refinement = adaptive_refinement;
         problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
+        problem.params.adaptive_geometry_density = adaptive_geometry_density;
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
@@ -413,7 +423,7 @@ int main(int argc, char **argv) {
 			return EXIT_FAILURE;
 		}
 		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
-			plane_fusion, plane_sample_stride);
+			plane_fusion, plane_sample_stride, adaptive_geometry_density);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
 		print_total_elapsed();
 		return EXIT_SUCCESS;
@@ -447,6 +457,8 @@ int main(int argc, char **argv) {
 		std::fill(early_stopped.begin(), early_stopped.end(), false);
 		for (auto &problem : problems) {
 			problem.iteration = iteration_index;
+			problem.update_adaptive_mask = !adaptive_geometry_density ||
+				((problem.iteration % 4 == 3) && (i + 1 < round_num));
 			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 			problem.params.scale_size = problem.scale_size;
 			{
@@ -484,6 +496,8 @@ int main(int argc, char **argv) {
 					continue;
 				}
 				problem.iteration = iteration_index;
+				problem.update_adaptive_mask = !adaptive_geometry_density ||
+					((problem.iteration % 4 == 3) && (i + 1 < round_num));
 				problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 				problem.params.scale_size = problem.scale_size;
 				{
@@ -520,13 +534,15 @@ int main(int argc, char **argv) {
 				const auto &state = *problem.adaptive_state;
 				WriteBinMat(problem.result_folder / "adaptive_frozen.dmb", state.mask);
 				WriteBinMat(problem.result_folder / "adaptive_stability.dmb", state.stability);
+				if (adaptive_geometry_density && !state.density_keep.empty())
+					WriteBinMat(problem.result_folder / "adaptive_density_keep.dmb", state.density_keep);
 			}
 		}
 		std::cout << "Round: " << i << " done\n";
 	}
 
 	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
-		plane_fusion, plane_sample_stride);
+		plane_fusion, plane_sample_stride, adaptive_geometry_density);
 	{// delete files
 		for (size_t i = 0; i < problems.size(); ++i) {
 			const auto &problem = problems[i];

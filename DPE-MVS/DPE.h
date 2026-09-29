@@ -45,7 +45,8 @@ template <typename TYPE>
 void RescaleMatToTargetSize(const cv::Mat &src, cv::Mat &dst, const cv::Size2i &target_size);
 
 void RunFusion(const path &dense_folder, const std::vector<Problem> &problems,
-	int simple_region_stride = 1, bool plane_fusion = false, int plane_sample_stride = 4);
+	int simple_region_stride = 1, bool plane_fusion = false, int plane_sample_stride = 4,
+	bool adaptive_geometry_density = false);
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems);
 void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem> &problems);
 
@@ -108,7 +109,8 @@ public:
 	cv::Mat GetEdge();
 	cv::Mat GetPixelStates();
 	void UpdateAdaptiveMaskFromConfidence(const cv::Mat &pixel_states,
-		const cv::Mat &confidence_costs);
+		const cv::Mat &confidence_costs, const cv::Mat &depth,
+		const cv::Mat &normal, const Camera &camera);
 	cv::Mat GetConfidenceCosts();
 	cv::Mat GetSelectedViews();
 	float GetAdaptiveFrozenFraction() const;
@@ -166,6 +168,8 @@ private:
 	cv::Mat edge_host;
 	cv::Mat edge_low_res_host;
 	cv::Mat adaptive_refinement_mask_host;
+	// One-point-per-frozen-parent sampling mask used by geometry-aware fusion.
+	cv::Mat adaptive_density_keep_host;
 	uchar *edge_cuda;
 	uchar *edge_low_res_cuda;
 	short2 *edge_neigh_cuda;
