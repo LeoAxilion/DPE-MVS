@@ -282,6 +282,8 @@ int main(int argc, char **argv) {
 					 "[--adaptive-refinement-early-stop FRACTION] "
 					 "[--adaptive-geometry-density] "
 						 "[--regional-adaptive-pyramid] "
+					 "[--texture-view-pair-prior] "
+					 "[--texture-view-pair-fusion-prior] "
 					 "[--adaptive-point-sampling] [--simple-region-stride N] "
 						 "[--plane-fusion] [--plane-sample-stride N] "
 						 "[--min-pyramid-levels N] "
@@ -299,6 +301,8 @@ int main(int argc, char **argv) {
 	float adaptive_refinement_early_stop = 0.0f;
 	bool adaptive_geometry_density = false;
 	bool regional_adaptive_pyramid = false;
+	bool texture_view_pair_prior = false;
+	bool texture_view_pair_fusion_prior = false;
     bool adaptive_point_sampling = false;
     int simple_region_stride = 2;
     bool plane_fusion = false;
@@ -321,6 +325,8 @@ int main(int argc, char **argv) {
 			else if (option == "--adaptive-refinement") adaptive_refinement = true;
 			else if (option == "--adaptive-geometry-density") adaptive_geometry_density = true;
 			else if (option == "--regional-adaptive-pyramid") regional_adaptive_pyramid = true;
+			else if (option == "--texture-view-pair-prior") texture_view_pair_prior = true;
+			else if (option == "--texture-view-pair-fusion-prior") texture_view_pair_fusion_prior = true;
             else if (option == "--adaptive-refinement-aggressiveness" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
@@ -391,6 +397,10 @@ int main(int argc, char **argv) {
 		if (adaptive_geometry_density) adaptive_refinement = true;
 		if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
 			throw std::invalid_argument("adaptive-refinement-early-stop requires --adaptive-refinement");
+		if (texture_view_pair_prior && texture_view_pair_fusion_prior)
+			throw std::invalid_argument("use either --texture-view-pair-prior or --texture-view-pair-fusion-prior");
+		if (texture_view_pair_fusion_prior && !fuse_only)
+			throw std::invalid_argument("--texture-view-pair-fusion-prior requires --fuse; it is a fusion-only option");
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
@@ -407,6 +417,7 @@ int main(int argc, char **argv) {
         problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
 		problem.params.adaptive_geometry_density = adaptive_geometry_density;
 		problem.params.regional_adaptive_pyramid = regional_adaptive_pyramid;
+		problem.params.texture_view_pair_prior = texture_view_pair_prior;
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
@@ -417,6 +428,8 @@ int main(int argc, char **argv) {
 		<< " (flat parents freeze complete child regions; one point retained per parent)" << std::endl;
 	std::cout << "Regional adaptive pyramid: " << regional_adaptive_pyramid
 		<< " (compact checkerboard worklists for active detail regions)" << std::endl;
+	std::cout << "TexRecon two-view prior: " << texture_view_pair_prior << std::endl;
+	std::cout << "TexRecon fusion-only two-view prior: " << texture_view_pair_fusion_prior << std::endl;
     std::cout << "Adaptive point sampling: " << adaptive_point_sampling
 	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
 	std::cout << "Plane fusion: " << plane_fusion << " (sample stride " << plane_sample_stride << ")" << std::endl;
@@ -437,7 +450,7 @@ int main(int argc, char **argv) {
 			return EXIT_FAILURE;
 		}
 		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
-			plane_fusion, plane_sample_stride, adaptive_geometry_density);
+			plane_fusion, plane_sample_stride, texture_view_pair_prior, texture_view_pair_fusion_prior);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
 		print_total_elapsed();
 		return EXIT_SUCCESS;
@@ -569,7 +582,8 @@ int main(int argc, char **argv) {
 	}
 
 	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
-		plane_fusion, plane_sample_stride, adaptive_geometry_density);
+		plane_fusion, plane_sample_stride, texture_view_pair_prior, texture_view_pair_fusion_prior,
+		adaptive_geometry_density);
 	{// delete files
 		for (size_t i = 0; i < problems.size(); ++i) {
 			const auto &problem = problems[i];

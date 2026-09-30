@@ -66,6 +66,34 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   they are persistent fusion inputs and are independent of
   `PatchMatchParams::geometric_anchor_cost` and intermediate-visualization output.
 
+- TexRecon two-view prior
+>
+    ./DPE $data_folder 0 --max-image-size 3200 --texture-view-pair-prior
+
+  First generate `texture_view_pair_prior.dmb` for each reference image with
+  `tools/generate_texture_view_pair_prior.py --pair-prior`. The script also
+  adds selected source images to `pair.txt` up to DPE's 31-source limit. It
+  refuses to install the maps or rewrite `pair.txt` if any pixel selecting the
+  reference has a partner outside that limit: such a `(-2, -1)` entry would
+  block every source during matching and fusion. Regenerate the prior after
+  changing `pair.txt`. Each prior stores local `pair.txt` source indices; `-2`
+  marks the current reference image and `-1` means no selected view. Matching
+  uses only the selected source view(s). Final fusion emits a pixel only when
+  its pair contains the reference image, and then validates it using only the
+  other selected view. The loader also rejects incomplete or out-of-range pair
+  maps before starting PatchMatch. If paired with
+  `--plane-fusion`, DPE uses pixel-level fusion because plane-patch fusion does
+  not retain per-pixel source-view assignments.
+
+  To use TexRecon's two-view selection only during fusion, first run ordinary
+  depth estimation without `--texture-view-pair-prior`. Then generate a global
+  view-ID map with `tools/generate_texture_view_pair_prior.py --fusion-pair-prior`
+  and run `./DPE $data_folder 0 --fuse --texture-view-pair-fusion-prior`.
+  This mode uses the saved depth maps for any of the scene's views and does not
+  change PatchMatch or `pair.txt`; incomplete pixels without a second selected
+  view are skipped during fusion. It therefore avoids the PatchMatch source
+  image limit while applying the prior only to final point-cloud validation.
+
 - Experimental adaptive refinement and point sampling
 >
     ./DPE $data_folder 0 --max-image-size 3200 --adaptive-refinement \

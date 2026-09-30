@@ -845,6 +845,18 @@ __device__ float ComputeBilateralNCCOld(
 	return cost;
 }
 
+__device__ bool TexturePairHasPrior(const int center, DataPassHelper *helper) {
+	if (!helper->texture_view_pair_prior_cuda) return false;
+	const int2 pair = helper->texture_view_pair_prior_cuda[center];
+	return pair.x != -1 || pair.y != -1;
+}
+
+__device__ bool TexturePairAllows(const int center, const int view_index, DataPassHelper *helper) {
+	if (!TexturePairHasPrior(center, helper)) return true;
+	const int2 pair = helper->texture_view_pair_prior_cuda[center];
+	return pair.x == view_index || pair.y == view_index;
+}
+
 __device__ float ComputeMultiViewInitialCostandSelectedViews(
 	const int2 p,
 	DataPassHelper *helper
@@ -861,6 +873,11 @@ __device__ float ComputeMultiViewInitialCostandSelectedViews(
 	int num_valid_views = 0;
 
 	for (int i = 1; i < params->num_images; ++i) {
+		if (TexturePairHasPrior(center, helper) && !TexturePairAllows(center, i - 1, helper)) {
+			cost_vector[i - 1] = cost_vector_copy[i - 1] = cost_max;
+			cost_count++;
+			continue;
+		}
 		float c = 0.0f;
 		c = ComputeBilateralNCCOld(p, i, plane_hypothesis, helper);
 		cost_vector[i - 1] = c;
@@ -908,6 +925,10 @@ __device__ float ComputeMultiViewInitialCost(
 
 	for (int i = 1; i < params->num_images; ++i) {
 		if (isSet(selected_views[center], i - 1)) {
+			if (!TexturePairAllows(center, i - 1, helper)) {
+				unSetBit(&(selected_views[center]), i - 1);
+				continue;
+			}
 			float c = ComputeBilateralNCCOld(p, i, plane_hypothesis, helper);
 			if (c < cost_max) {
 				cost_count++;
@@ -927,10 +948,15 @@ __device__ float ComputeMultiViewInitialCost(
 __device__ void ComputeMultiViewCostVectorNew(
 	const int2 p, 
 	float4 plane_hypothesis,
-	float *cost_vector,
+		float *cost_vector,
 	DataPassHelper *helper
 ) {
 	for (int i = 1; i < helper->params->num_images; ++i) {
+		const int center = p.x + p.y * helper->width;
+		if (TexturePairHasPrior(center, helper) && !TexturePairAllows(center, i - 1, helper)) {
+			cost_vector[i - 1] = 2.0f;
+			continue;
+		}
 		cost_vector[i - 1] = ComputeBilateralNCCNew(p, i, plane_hypothesis, helper);
 	}
 }
@@ -940,8 +966,13 @@ __device__ void ComputeMultiViewCostVectorOld(
 	float4 plane_hypothesis,
 	float *cost_vector,
 	DataPassHelper *helper
-) {
+	) {
 	for (int i = 1; i < helper->params->num_images; ++i) {
+		const int center = p.x + p.y * helper->width;
+		if (TexturePairHasPrior(center, helper) && !TexturePairAllows(center, i - 1, helper)) {
+			cost_vector[i - 1] = 2.0f;
+			continue;
+		}
 		cost_vector[i - 1] = ComputeBilateralNCCOld(p, i, plane_hypothesis, helper);
 	}
 }
@@ -2696,7 +2727,7 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 	float weight_normal = 0.0f;
 	for (int src_index = 1; src_index < num_images; ++src_index) {
 		int view_index = src_index - 1;
-		if (isSet(selected_views[center], view_index)) {
+		if (isSet(selected_views[center], view_index) && TexturePairAllows(center, view_index, helper)) {
 			float4 temp_plane_hypothesis = origin_plane_hypothesis;
 			temp_plane_hypothesis.w = GetDistance2Origin(cameras[0], point, origin_depth, temp_plane_hypothesis);
 			float temp_cost = ComputeBilateralNCCOld(point, src_index, temp_plane_hypothesis, helper);
@@ -2742,7 +2773,7 @@ __global__ void DepthToWeak(DataPassHelper *helper) {
 		for (int src_index = 1; src_index < num_images; ++src_index) {
 			int view_index = src_index - 1;
 			float temp_cost = 0.0f;
- 			if (isSet(selected_views[center], view_index)) {
+			if (isSet(selected_views[center], view_index) && TexturePairAllows(center, view_index, helper)) {
 				temp_cost += ComputeBilateralNCCOld(point, src_index, temp_plane_hypothesis, helper);
 				if (helper->params->geom_consistency) {
 					temp_cost += helper->params->geom_factor * ComputeGeomConsistencyCost(point, src_index, temp_plane_hypothesis, helper);
@@ -2845,7 +2876,7 @@ __global__ void LocalRefine(DataPassHelper *helper) {
 	float weight_normal = 0.0f;
 	for (int src_index = 1; src_index < num_images; ++src_index) {
 		int view_index = src_index - 1;
-		if (isSet(selected_views[center], view_index)) {
+		if (isSet(selected_views[center], view_index) && TexturePairAllows(center, view_index, helper)) {
 			float4 temp_plane_hypothesis = origin_plane_hypothesis;
 			temp_plane_hypothesis.w = GetDistance2Origin(cameras[0], point, origin_depth, temp_plane_hypothesis);
 			float temp_cost = ComputeBilateralNCCOld(point, src_index, temp_plane_hypothesis, helper);
@@ -2886,7 +2917,7 @@ __global__ void LocalRefine(DataPassHelper *helper) {
 		float temp_cost = 0.0f;
 		for (int src_index = 1; src_index < num_images; ++src_index) {
 			int view_index = src_index - 1;
-			if (isSet(selected_views[center], view_index)) {
+			if (isSet(selected_views[center], view_index) && TexturePairAllows(center, view_index, helper)) {
 				temp_cost += (ComputeBilateralNCCOld(point, src_index, temp_plane_hypothesis, helper) * view_weight[view_index]);
 				if (helper->params->geom_consistency) {
 					temp_cost += (helper->params->geom_factor * ComputeGeomConsistencyCost(point, src_index, temp_plane_hypothesis, helper) * view_weight[view_index]);

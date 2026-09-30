@@ -91,6 +91,7 @@ struct PatchMatchParams {
 	// the regional pyramid mode: frozen planar children remain logical leaves
 	// and do not receive PatchMatch work at the finer scale.
 	bool regional_adaptive_pyramid = false;
+	bool texture_view_pair_prior = false; // Restrict each pixel to its two TexRecon-selected views.
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
 	float sigma_color = 3.0f;
