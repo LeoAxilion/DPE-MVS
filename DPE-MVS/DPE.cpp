@@ -1531,7 +1531,7 @@ void DPE::UpdateAdaptiveMaskFromConfidence() {
 	if (active_pixel_count > 0) {
 		CUDA_SAFE_CALL(cudaDeviceSynchronize());
 		CUDA_SAFE_CALL(cudaGetLastError());
-		LaunchAdaptiveFreezeMaskKernel(weak_info_cuda, costs_cuda, plane_hypotheses_cuda,
+		LaunchAdaptiveFreezeMaskKernel(weak_info_cuda, plane_hypotheses_cuda,
 			adaptive_refinement_mask_cuda, active_pixel_indices_cuda, active_pixel_count,
 			width, height, cameras_cuda, params_host.depth_min, params_host.depth_max,
 			problem.params.adaptive_geometry_density, min_planar_agreements,
@@ -1553,8 +1553,7 @@ void DPE::UpdateAdaptiveMaskFromConfidence() {
 	adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
 		static_cast<float>(std::max(1, adaptive_refinement_mask_host.rows * adaptive_refinement_mask_host.cols));
 	std::cout << "Adaptive confidence freeze: " << counters[0] << " newly frozen ("
-		<< counters[1] << " strong, " << counters[2]
-		<< " weak cost <= 0.15), "
+		<< counters[1] << " strong, " << counters[2] << " weak), "
 		<< (100.0f * adaptive_frozen_fraction) << "% total";
 	if (problem.params.adaptive_geometry_density)
 		std::cout << "; geometry rejected " << counters[3] << " high-confidence pixels";

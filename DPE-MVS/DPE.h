@@ -39,9 +39,9 @@ bool ExportFusedPointCloud(const path& point_cloud_path, const std::vector<Point
 
 // Evaluate adaptive freeze candidates in parallel from the PatchMatch buffers
 // that already reside on the GPU. Counter order: newly frozen, strong,
-// low-cost weak, geometry rejected.
+// weak, geometry rejected.
 void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
-	const float *costs_cuda, const float4 *plane_hypotheses_cuda,
+	const float4 *plane_hypotheses_cuda,
 	uchar *adaptive_mask_cuda, const int *active_pixel_indices_cuda,
 	int active_pixel_count, int width, int height, const Camera *camera_cuda,
 	float depth_min, float depth_max, bool geometry_check,

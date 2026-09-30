@@ -197,7 +197,6 @@ float ProcessProblem(const Problem &problem) {
 	cv::Mat depth = cv::Mat(height, width, CV_32FC1);
 	cv::Mat normal = cv::Mat(height, width, CV_32FC3);
 	cv::Mat pixel_states = DPE.GetPixelStates();
-	cv::Mat confidence_costs = DPE.GetConfidenceCosts();
 	for (int r = 0; r < height; ++r) {
 		for (int c = 0; c < width; ++c) {
 			float4 plane_hypothesis = DPE.GetPlaneHypothesis(r, c);

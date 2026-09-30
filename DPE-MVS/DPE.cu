@@ -1100,12 +1100,13 @@ __global__ void InitRandomStates(
 	curand_init(clock64(), p.y, p.x, &rand_states[center]);
 }
 
+template <bool Compact>
 __global__ void RandomInitialization(
 	DataPassHelper *helper
 ) {
 	int width = helper->width;
 	int height = helper->height;
-	const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 p = WorkPixel<Compact>(helper);
 	if (p.x >= width || p.y >= height) {
 		return;
 	}
@@ -2921,8 +2922,9 @@ __global__ void FindNearestStrongPointInit(DataPassHelper *helper) {
 }
 
 
+template <bool Compact>
 __global__ void FindNearestStrongPoint(DataPassHelper *helper) {
-	const int2 point = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 point = WorkPixel<Compact>(helper);
 	const int width = helper->width;
 	const int height = helper->height;
 	if (point.x >= width || point.y >= height) {
@@ -3254,7 +3256,7 @@ __device__ bool AdaptiveGeometryStable(const float4 *planes, int width, int heig
 
 template <bool Compact>
 __global__ void AdaptiveFreezeMaskKernel(const uchar *pixel_states,
-	const float *costs, const float4 *planes, uchar *adaptive_mask,
+	const float4 *planes, uchar *adaptive_mask,
 	const int *active_pixel_indices, int active_pixel_count,
 	int width, int height, const Camera *camera, float depth_min, float depth_max,
 	bool geometry_check, int min_planar_agreements, float max_normal_angle_degrees,
@@ -3279,15 +3281,15 @@ __global__ void AdaptiveFreezeMaskKernel(const uchar *pixel_states,
 		// classification. NaNs remain unchanged here, as they do in its comparisons.
 		if (plane.w < depth_min || plane.w > depth_max) state = UNKNOWN;
 		const bool strong = state == STRONG;
-		const bool weak_low_cost = state == WEAK && AdaptiveFinite(costs[index]) && costs[index] <= 0.15f;
+		const bool weak_candidate = state == WEAK;
 		bool geometry_stable = true;
-		if (geometry_check && (strong || weak_low_cost)) {
+		if (geometry_check && (strong || weak_candidate)) {
 			geometry_stable = AdaptiveGeometryStable(planes, width, height,
 				index / width, index % width, camera[0], min_planar_agreements,
 				max_normal_angle_degrees, max_relative_depth_error);
 			if (!geometry_stable) atomicAdd(&block_counters[3], 1);
 		}
-		if (adaptive_mask[index] != 0 && (strong || weak_low_cost) && geometry_stable) {
+		if (adaptive_mask[index] != 0 && (strong || weak_candidate) && geometry_stable) {
 			adaptive_mask[index] = 0;
 			atomicAdd(&block_counters[0], 1);
 			atomicAdd(&block_counters[strong ? 1 : 2], 1);
@@ -3300,7 +3302,7 @@ __global__ void AdaptiveFreezeMaskKernel(const uchar *pixel_states,
 }
 
 void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
-	const float *costs_cuda, const float4 *plane_hypotheses_cuda,
+	const float4 *plane_hypotheses_cuda,
 	uchar *adaptive_mask_cuda, const int *active_pixel_indices_cuda,
 	int active_pixel_count, int width, int height, const Camera *camera_cuda,
 	float depth_min, float depth_max, bool geometry_check,
@@ -3310,13 +3312,13 @@ void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
 	if (active_pixel_indices_cuda && active_pixel_count < length) {
 		if (active_pixel_count <= 0) return;
 		AdaptiveFreezeMaskKernel<true><<<(active_pixel_count + 255) / 256, 256>>>(
-			pixel_states_cuda, costs_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
+			pixel_states_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
 			active_pixel_indices_cuda, active_pixel_count, width, height, camera_cuda,
 			depth_min, depth_max, geometry_check, min_planar_agreements,
 			max_normal_angle_degrees, max_relative_depth_error, counters_cuda);
 	} else {
 		AdaptiveFreezeMaskKernel<false><<<(length + 255) / 256, 256>>>(
-			pixel_states_cuda, costs_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
+			pixel_states_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
 			nullptr, length, width, height, camera_cuda, depth_min, depth_max,
 			geometry_check, min_planar_agreements, max_normal_angle_degrees,
 			max_relative_depth_error, counters_cuda);
