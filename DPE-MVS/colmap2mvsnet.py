@@ -13,6 +13,7 @@ import multiprocessing as mp
 from functools import partial
 import os
 import argparse
+import json
 import shutil
 import cv2
 
@@ -354,6 +355,15 @@ def processing_single_scene(args):
     for i, image_id in enumerate(sorted(images.keys())):
         new_images[i+1] = images[image_id]
     images = new_images
+    dpe_view_manifest = {
+        "format_version": 1,
+        "index_base": 0,
+        "views": [
+            {"dpe_index": i, "colmap_image_id": int(images[i + 1].id),
+             "image_name": images[i + 1].name}
+            for i in range(num_images)
+        ],
+    }
 
     # extrinsic
     extrinsic = {}
@@ -426,6 +436,9 @@ def processing_single_scene(args):
         os.makedirs(cam_dir)
     except os.error:
         print(cam_dir + ' already exist.')
+    with open(os.path.join(args.save_folder, 'dpe_view_index.json'), 'w') as f:
+        json.dump(dpe_view_manifest, f, indent=2, ensure_ascii=False)
+        f.write('\n')
     for i in range(num_images):
         with open(os.path.join(cam_dir, '%08d_cam.txt' % i), 'w') as f:
             f.write('extrinsic\n')

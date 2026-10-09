@@ -65,6 +65,12 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   A normal depth-estimation run also preserves these three files after fusion;
   they are persistent fusion inputs and are independent of
   `PatchMatchParams::geometric_anchor_cost` and intermediate-visualization output.
+  In particular, every reference image keeps its final per-image depth map at
+  `$data_folder/DPE/########/depths.dmb`, even when intermediate visualization
+  images are not requested. `colmap2mvsnet.py` writes
+  `$data_folder/dpe_view_index.json` to map each zero-based DPE index back to
+  its COLMAP image ID and source image name. These maps can be used later for
+  source-image visibility checks without rerunning PatchMatch.
 
 - TexRecon two-view prior
 >
