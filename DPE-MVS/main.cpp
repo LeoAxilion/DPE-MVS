@@ -211,7 +211,7 @@ float ProcessProblem(const Problem &problem) {
 	// DepthToWeak has now produced the real confidence state. In geometry-aware
 	// mode, only locally planar high-confidence pixels are frozen, so depth
 	// discontinuities remain active for finer pyramid levels.
-	DPE.UpdateAdaptiveMaskFromConfidence();
+	DPE.UpdateGeometryConsistentAdaptiveMask();
 	
 	path depth_path = problem.result_folder / path("depths.dmb");
 	WriteBinMat(depth_path, depth);
@@ -277,10 +277,9 @@ int main(int argc, char **argv) {
                      "[--geometric-anchor-cost] "
 					 "[--max-image-size N] "
                      "[--show-medium-result] "
-					 "[--adaptive-refinement] "
+					 "[--no-adaptive-geometry-density] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
-					 "[--adaptive-geometry-density] "
 						 "[--regional-adaptive-pyramid] "
 					 "[--texture-view-pair-prior] "
 					 "[--texture-view-pair-fusion-prior] "
@@ -292,14 +291,15 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
-    int gpu_index = 0, max_image_size = 3200;
+    int gpu_index = 0, max_image_size = 1800;
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
     bool show_medium_result = false;
-    bool adaptive_refinement = false;
+    bool adaptive_refinement = true;
     int adaptive_refinement_aggressiveness = 1;
 	float adaptive_refinement_early_stop = 0.0f;
-	bool adaptive_geometry_density = false;
+	bool adaptive_geometry_density = true;
+	bool disable_adaptive_geometry_density = false;
 	bool regional_adaptive_pyramid = false;
 	bool texture_view_pair_prior = false;
 	bool texture_view_pair_fusion_prior = false;
@@ -322,8 +322,12 @@ int main(int argc, char **argv) {
             if (option == "--fuse") fuse_only = true;
             else if (option == "--geometric-anchor-cost") geometric_anchor_cost = true;
             else if (option == "--show-medium-result") show_medium_result = true;
-			else if (option == "--adaptive-refinement") adaptive_refinement = true;
-			else if (option == "--adaptive-geometry-density") adaptive_geometry_density = true;
+			else if (option == "--adaptive-refinement") {
+				// Legacy no-op: geometry-consistent freezing is enabled by default.
+			}
+			else if (option == "--no-adaptive-refinement" ||
+				option == "--no-adaptive-geometry-density")
+				disable_adaptive_geometry_density = true;
 			else if (option == "--regional-adaptive-pyramid") regional_adaptive_pyramid = true;
 			else if (option == "--texture-view-pair-prior") texture_view_pair_prior = true;
 			else if (option == "--texture-view-pair-fusion-prior") texture_view_pair_fusion_prior = true;
@@ -393,10 +397,12 @@ int main(int argc, char **argv) {
                 if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
-		if (regional_adaptive_pyramid) adaptive_geometry_density = true;
-		if (adaptive_geometry_density) adaptive_refinement = true;
+		adaptive_geometry_density = !disable_adaptive_geometry_density;
+		adaptive_refinement = adaptive_geometry_density;
+		if (regional_adaptive_pyramid && !adaptive_geometry_density)
+			throw std::invalid_argument("--regional-adaptive-pyramid requires geometry-consistent freezing; remove --no-adaptive-geometry-density");
 		if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
-			throw std::invalid_argument("adaptive-refinement-early-stop requires --adaptive-refinement");
+			throw std::invalid_argument("adaptive-refinement-early-stop requires geometry-consistent freezing; remove --no-adaptive-geometry-density");
 		if (texture_view_pair_prior && texture_view_pair_fusion_prior)
 			throw std::invalid_argument("use either --texture-view-pair-prior or --texture-view-pair-fusion-prior");
 		if (texture_view_pair_fusion_prior && !fuse_only)
@@ -421,7 +427,7 @@ int main(int argc, char **argv) {
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
-	std::cout << "Adaptive refinement: " << adaptive_refinement << " (aggressiveness "
+	std::cout << "Geometry-consistent adaptive freezing: " << adaptive_refinement << " (aggressiveness "
 		<< adaptive_refinement_aggressiveness << ", early-stop threshold "
 		<< adaptive_refinement_early_stop << ")" << std::endl;
 	std::cout << "Adaptive geometry density: " << adaptive_geometry_density
@@ -450,7 +456,8 @@ int main(int argc, char **argv) {
 			return EXIT_FAILURE;
 		}
 		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
-			plane_fusion, plane_sample_stride, texture_view_pair_prior, texture_view_pair_fusion_prior);
+			plane_fusion, plane_sample_stride, texture_view_pair_prior, texture_view_pair_fusion_prior,
+			adaptive_geometry_density);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
 		print_total_elapsed();
 		return EXIT_SUCCESS;
@@ -484,7 +491,7 @@ int main(int argc, char **argv) {
 		std::fill(early_stopped.begin(), early_stopped.end(), false);
 		for (auto &problem : problems) {
 			problem.iteration = iteration_index;
-			problem.update_adaptive_mask = !adaptive_geometry_density ||
+			problem.update_adaptive_mask = adaptive_refinement &&
 				((problem.iteration % 4 == 3) && (i + 1 < round_num));
 			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 			problem.params.scale_size = problem.scale_size;
@@ -523,7 +530,7 @@ int main(int argc, char **argv) {
 					continue;
 				}
 				problem.iteration = iteration_index;
-				problem.update_adaptive_mask = !adaptive_geometry_density ||
+				problem.update_adaptive_mask = adaptive_refinement &&
 					((problem.iteration % 4 == 3) && (i + 1 < round_num));
 				problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 				problem.params.scale_size = problem.scale_size;

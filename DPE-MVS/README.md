@@ -40,6 +40,13 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
     Run ./DPE $data_folder to get reconstruction results.
     The result will be saved in the folder $data_folder/DPE, and the point cloud is saved as "DPE.ply"
 
+  Defaults: the longest image edge is capped at 1800 pixels, geometry-aware
+  adaptive freezing is enabled, and final fusion retains one representative
+  point for each frozen planar parent while keeping all points in active detail
+  regions. Use `--max-image-size N` to override the cap (`0` keeps the input
+  resolution). Use `--no-adaptive-geometry-density` to disable geometry-
+  consistent freezing and its density-aware fusion behavior.
+
 - Fuse existing depth maps only
 >
     ./DPE $data_folder 0 --fuse
@@ -100,28 +107,40 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   view are skipped during fusion. It therefore avoids the PatchMatch source
   image limit while applying the prior only to final point-cloud validation.
 
-- Experimental adaptive refinement and point sampling
+- Geometry-aware adaptive refinement and optional point sampling
 >
-    ./DPE $data_folder 0 --max-image-size 3200 --adaptive-refinement \
-      --adaptive-point-sampling --simple-region-stride 2
+    ./DPE $data_folder 0 --adaptive-point-sampling --simple-region-stride 2
 
-  `--adaptive-refinement` keeps the depth maps dense but stops updating pixels
-  whose completed PatchMatch confidence state is `STRONG`, or whose `WEAK`
-  state has a post-anchor PatchMatch cost at most `0.15`. The confidence state
-  is read after `DepthToWeak`, and the cost is read after anchor propagation
-  and local refinement, so the initial random-plane
-  setup is never used as a freeze decision. A qualifying pixel freezes
-  immediately, and frozen pixels remain frozen in later iterations and are
-  propagated to finer scales by freezing one representative pixel per frozen
-  parent. The other pixels created by upsampling remain active with fresh
-  state to recover fine detail, even when their parent was frozen.
-  State is retained in memory between passes and checkpointed after each pyramid
-  level, including images stopped early. `--start-round` reloads these completed
-  level checkpoints. Neighbour generation, neighbour updating, RANSAC plane
-  fitting, and local refinement use the active-pixel list once at least 25% of
-  the pixels are frozen; below that threshold they use the full image grid.
-  The legacy `--adaptive-refinement-aggressiveness` option is retained for
-  command-line compatibility but no longer changes the freeze decision.
+  Geometry-consistent freezing is enabled by default. At each scale boundary,
+  STRONG and WEAK pixels are candidates, but freeze only when their plane agrees
+  with the required neighbors and their depth is in range;
+  default aggressiveness 1 requires 8/8 neighbors, normal differences at most
+  12 degrees, and relative depth error at most 1.25%. Frozen regions remain
+  frozen at finer scales. Their child regions are not refined, and final fusion
+  keeps one representative point per frozen planar parent while retaining all
+  candidates in active, geometrically complex regions. This preserves dense
+  detail near depth changes while reducing redundant planar samples.
+
+  `--no-adaptive-geometry-density` disables all freezing and density-aware
+  fusion, restoring the standard dense path. The former
+  `--adaptive-geometry-density` enable flag has been replaced by this
+  default-on opt-out. `--no-adaptive-refinement` remains as a legacy alias;
+  `--adaptive-refinement` remains accepted as a no-op for old command lines.
+  Confidence-only freezing has been removed. In fusion-only mode,
+  geometry-aware fusion needs
+  `adaptive_density_keep.dmb` files produced by a matching adaptive run; pass
+  `--no-adaptive-geometry-density` to fuse older depth maps with the standard path.
+
+  The confidence state is read after `DepthToWeak`; the initial random-plane
+  setup is never used as a freeze decision. State is retained in memory between
+  passes and checkpointed after each pyramid level, including images stopped
+  early. `--start-round` reloads these completed level checkpoints. Neighbour
+  generation, neighbour updating, RANSAC plane fitting, and local refinement
+  use the active-pixel list once at least 25% of the pixels are frozen; below
+  that threshold they use the full image grid.
+  `--adaptive-refinement-aggressiveness` controls the plane-consensus threshold:
+  level 1 requires 8/8 neighbors, 12-degree normal tolerance, and 1.25% relative
+  depth tolerance; levels 2 and 3 relax these thresholds.
   The frozen mask stops depth/normal refinement and skips building an anchor
   list or fitting a plane for the frozen pixel itself. Frozen strong pixels
   remain available as anchors for active neighbours, and nearest-strong
@@ -143,10 +162,11 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   `--adaptive-point-sampling` applies the
   same local plane test during fusion and samples accepted planar regions on a
   regular grid; stride 2 keeps one quarter of those planar candidates while
-  retaining all candidates in locally complex areas. Both options are off by
-  default. This is a speed/quality trade-off and should be checked against the
-  unmodified result for each scene. Fusion-only mode supports the point-sampling
-  options without rerunning depth estimation.
+  retaining all candidates in locally complex areas. This additional sampling
+  option remains off by default; the geometry-aware frozen-parent fusion above
+  is on by default. This is a speed/quality trade-off and should be checked
+  against the unmodified result for each scene. Fusion-only mode supports the
+  point-sampling option without rerunning depth estimation.
 
   `--start-round N` resumes from an already completed preceding pyramid scale.
   Use it only when every per-image depth, normal, weak-state, and selected-view

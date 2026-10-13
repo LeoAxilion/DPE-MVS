@@ -37,15 +37,15 @@ bool ExportPointCloud(const path& point_cloud_path, std::vector<PointList>& poin
 // Separate COLMAP-compatible export; the original DPE.ply writer is unchanged.
 bool ExportFusedPointCloud(const path& point_cloud_path, const std::vector<PointList>& pointcloud);
 
-// Evaluate adaptive freeze candidates in parallel from the PatchMatch buffers
-// that already reside on the GPU. Counter order: newly frozen, strong,
-// weak, geometry rejected.
+// Evaluate geometry-consistent freeze candidates in parallel from the
+// PatchMatch buffers that already reside on the GPU. Counter order: newly
+// frozen, strong, weak, geometry rejected.
 void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
 	const float4 *plane_hypotheses_cuda,
 	uchar *adaptive_mask_cuda, const int *active_pixel_indices_cuda,
 	int active_pixel_count, int width, int height, const Camera *camera_cuda,
-	float depth_min, float depth_max, bool geometry_check,
-	int min_planar_agreements, float max_normal_angle_degrees,
+	float depth_min, float depth_max, int min_planar_agreements,
+	float max_normal_angle_degrees,
 	float max_relative_depth_error, int *counters_cuda);
 
 void ExportDepthImagePointCloud(const path& point_cloud_path, const path& image_path, const path& cam_path, cv::Mat& depth, float depth_min, float depth_max);
@@ -125,7 +125,7 @@ public:
 	float4 GetPlaneHypothesis(int r, int c);
 	cv::Mat GetEdge();
 	cv::Mat GetPixelStates();
-	void UpdateAdaptiveMaskFromConfidence();
+	void UpdateGeometryConsistentAdaptiveMask();
 	cv::Mat GetSelectedViews();
 	float GetAdaptiveFrozenFraction() const;
 	cv::Mat GetRadiusMap();

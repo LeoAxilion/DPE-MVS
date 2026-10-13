@@ -3290,7 +3290,7 @@ __global__ void AdaptiveFreezeMaskKernel(const uchar *pixel_states,
 	const float4 *planes, uchar *adaptive_mask,
 	const int *active_pixel_indices, int active_pixel_count,
 	int width, int height, const Camera *camera, float depth_min, float depth_max,
-	bool geometry_check, int min_planar_agreements, float max_normal_angle_degrees,
+	int min_planar_agreements, float max_normal_angle_degrees,
 	float max_relative_depth_error, int *counters) {
 	__shared__ int block_counters[4];
 	if (threadIdx.x < 4) block_counters[threadIdx.x] = 0;
@@ -3313,17 +3313,16 @@ __global__ void AdaptiveFreezeMaskKernel(const uchar *pixel_states,
 		if (plane.w < depth_min || plane.w > depth_max) state = UNKNOWN;
 		const bool strong = state == STRONG;
 		const bool weak_candidate = state == WEAK;
-		bool geometry_stable = true;
-		if (geometry_check && (strong || weak_candidate)) {
-			geometry_stable = AdaptiveGeometryStable(planes, width, height,
+		if (strong || weak_candidate) {
+			const bool geometry_stable = AdaptiveGeometryStable(planes, width, height,
 				index / width, index % width, camera[0], min_planar_agreements,
 				max_normal_angle_degrees, max_relative_depth_error);
 			if (!geometry_stable) atomicAdd(&block_counters[3], 1);
-		}
-		if (adaptive_mask[index] != 0 && (strong || weak_candidate) && geometry_stable) {
-			adaptive_mask[index] = 0;
-			atomicAdd(&block_counters[0], 1);
-			atomicAdd(&block_counters[strong ? 1 : 2], 1);
+			if (geometry_stable) {
+				adaptive_mask[index] = 0;
+				atomicAdd(&block_counters[0], 1);
+				atomicAdd(&block_counters[strong ? 1 : 2], 1);
+			}
 		}
 	}
 	__syncthreads();
@@ -3336,8 +3335,8 @@ void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
 	const float4 *plane_hypotheses_cuda,
 	uchar *adaptive_mask_cuda, const int *active_pixel_indices_cuda,
 	int active_pixel_count, int width, int height, const Camera *camera_cuda,
-	float depth_min, float depth_max, bool geometry_check,
-	int min_planar_agreements, float max_normal_angle_degrees,
+	float depth_min, float depth_max, int min_planar_agreements,
+	float max_normal_angle_degrees,
 	float max_relative_depth_error, int *counters_cuda) {
 	const int length = width * height;
 	if (active_pixel_indices_cuda && active_pixel_count < length) {
@@ -3345,13 +3344,13 @@ void LaunchAdaptiveFreezeMaskKernel(const uchar *pixel_states_cuda,
 		AdaptiveFreezeMaskKernel<true><<<(active_pixel_count + 255) / 256, 256>>>(
 			pixel_states_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
 			active_pixel_indices_cuda, active_pixel_count, width, height, camera_cuda,
-			depth_min, depth_max, geometry_check, min_planar_agreements,
+			depth_min, depth_max, min_planar_agreements,
 			max_normal_angle_degrees, max_relative_depth_error, counters_cuda);
 	} else {
 		AdaptiveFreezeMaskKernel<false><<<(length + 255) / 256, 256>>>(
 			pixel_states_cuda, plane_hypotheses_cuda, adaptive_mask_cuda,
 			nullptr, length, width, height, camera_cuda, depth_min, depth_max,
-			geometry_check, min_planar_agreements, max_normal_angle_degrees,
+			min_planar_agreements, max_normal_angle_degrees,
 			max_relative_depth_error, counters_cuda);
 	}
 }

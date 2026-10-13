@@ -56,59 +56,13 @@ void ValidateTexturePairPrior(const cv::Mat &prior, int num_sources, const path 
 	}
 }
 
-// Preserve one representative of each frozen pixel at finer pyramid levels.
-// Newly created pixels stay active so they can resolve finer-scale details.
-// On downsampling, retain the conservative footprint behavior.
 int RepresentativeCoordinate(int source_coordinate, int source_length, int target_length) {
 	return static_cast<int>(((2LL * source_coordinate + 1) * target_length) /
 		(2LL * source_length));
 }
 
-cv::Mat PropagateFrozenMask(const cv::Mat &source, const cv::Size &target_size) {
-	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
-	cv::Mat target(target_size, CV_8UC1, cv::Scalar(1));
-	if (target.cols >= source.cols && target.rows >= source.rows) {
-		for (int y = 0; y < source.rows; ++y) {
-			const uchar *source_row = source.ptr<uchar>(y);
-			const int target_y = RepresentativeCoordinate(y, source.rows, target.rows);
-			uchar *target_row = target.ptr<uchar>(target_y);
-			for (int x = 0; x < source.cols; ++x) {
-				if (source_row[x] == 0) {
-					const int target_x = RepresentativeCoordinate(x, source.cols, target.cols);
-					target_row[target_x] = 0;
-				}
-			}
-		}
-		return target;
-	}
-	for (int y = 0; y < target.rows; ++y) {
-		const int source_y_begin = y * source.rows / target.rows;
-		const int source_y_end = std::min(source.rows,
-			((y + 1) * source.rows + target.rows - 1) / target.rows);
-		for (int x = 0; x < target.cols; ++x) {
-			const int source_x_begin = x * source.cols / target.cols;
-			const int source_x_end = std::min(source.cols,
-				((x + 1) * source.cols + target.cols - 1) / target.cols);
-			bool frozen = false;
-			for (int sy = source_y_begin; sy < std::max(source_y_begin + 1, source_y_end) && !frozen; ++sy) {
-				const uchar *source_row = source.ptr<uchar>(std::min(sy, source.rows - 1));
-				for (int sx = source_x_begin; sx < std::max(source_x_begin + 1, source_x_end); ++sx) {
-					if (source_row[std::min(sx, source.cols - 1)] == 0) {
-						frozen = true;
-						break;
-					}
-				}
-			}
-			if (frozen) target.at<uchar>(y, x) = 0;
-		}
-	}
-	return target;
-}
-
-// Geometry-aware density mode freezes every child of a stable parent region.
-// This is deliberately separate from the legacy representative-only mask:
-// the latter preserves fine-scale work around a frozen pixel, while this mode
-// is intended to stop upsampling across an entire locally planar footprint.
+// Geometry-consistent freezing propagates a stable parent region to all of its
+// children, preventing further upsampling across a locally planar footprint.
 cv::Mat PropagateFrozenRegionMask(const cv::Mat &source, const cv::Size &target_size) {
 	CV_Assert(source.type() == CV_8UC1 && target_size.width > 0 && target_size.height > 0);
 	if (target_size.width <= source.cols && target_size.height <= source.rows) {
@@ -1452,18 +1406,14 @@ void DPE::SupportInitialization() {
 		if (!previous_mask.empty() && previous_mask.type() == CV_8UC1) {
 			if (previous_mask.size() != adaptive_refinement_mask_host.size()) {
 				const int previous_frozen = previous_mask.total() - cv::countNonZero(previous_mask);
-				adaptive_refinement_mask_host = problem.params.adaptive_geometry_density
-					? PropagateFrozenRegionMask(previous_mask, adaptive_refinement_mask_host.size())
-					: PropagateFrozenMask(previous_mask, adaptive_refinement_mask_host.size());
+				adaptive_refinement_mask_host = PropagateFrozenRegionMask(
+					previous_mask, adaptive_refinement_mask_host.size());
 				const int inherited_frozen = adaptive_refinement_mask_host.total() -
 					cv::countNonZero(adaptive_refinement_mask_host);
 				std::cout << "Adaptive freeze propagation: " << previous_mask.cols << "x" << previous_mask.rows
 					<< " (" << previous_frozen << " frozen) -> " << adaptive_refinement_mask_host.cols << "x"
 					<< adaptive_refinement_mask_host.rows << " (" << inherited_frozen
-					<< " frozen"
-					<< (problem.params.adaptive_geometry_density
-						? "; complete frozen parent regions)\n"
-						: "; one representative per frozen parent)\n");
+					<< " frozen; complete frozen parent regions)\n";
 			} else {
 				adaptive_refinement_mask_host = previous_mask;
 			}
@@ -1567,8 +1517,9 @@ cv::Mat DPE::GetPixelStates() {
 	return weak_info_host;
 }
 
-void DPE::UpdateAdaptiveMaskFromConfidence() {
-	if (!problem.params.adaptive_refinement || adaptive_refinement_mask_host.empty() ||
+void DPE::UpdateGeometryConsistentAdaptiveMask() {
+	if (!problem.params.adaptive_refinement || !problem.params.adaptive_geometry_density ||
+		adaptive_refinement_mask_host.empty() ||
 		!problem.update_adaptive_mask) return;
 	AdaptiveRefinementState &state = *problem.adaptive_state;
 	const auto update_start = std::chrono::steady_clock::now();
@@ -1587,8 +1538,8 @@ void DPE::UpdateAdaptiveMaskFromConfidence() {
 		LaunchAdaptiveFreezeMaskKernel(weak_info_cuda, plane_hypotheses_cuda,
 			adaptive_refinement_mask_cuda, active_pixel_indices_cuda, active_pixel_count,
 			width, height, cameras_cuda, params_host.depth_min, params_host.depth_max,
-			problem.params.adaptive_geometry_density, min_planar_agreements,
-			max_normal_angle, max_relative_depth_error, adaptive_freeze_counters_cuda);
+			min_planar_agreements, max_normal_angle, max_relative_depth_error,
+			adaptive_freeze_counters_cuda);
 		CUDA_SAFE_CALL(cudaGetLastError());
 	}
 	CUDA_SAFE_CALL(cudaMemcpy(counters, adaptive_freeze_counters_cuda, sizeof(counters),
@@ -1605,14 +1556,13 @@ void DPE::UpdateAdaptiveMaskFromConfidence() {
 	state.mask = adaptive_refinement_mask_host;
 	adaptive_frozen_fraction = 1.0f - static_cast<float>(cv::countNonZero(adaptive_refinement_mask_host)) /
 		static_cast<float>(std::max(1, adaptive_refinement_mask_host.rows * adaptive_refinement_mask_host.cols));
-	std::cout << "Adaptive confidence freeze: " << counters[0] << " newly frozen ("
+	std::cout << "Geometry-consistent freeze: " << counters[0] << " newly frozen ("
 		<< counters[1] << " strong, " << counters[2] << " weak), "
 		<< (100.0f * adaptive_frozen_fraction) << "% total";
-	if (problem.params.adaptive_geometry_density)
-		std::cout << "; geometry rejected " << counters[3] << " high-confidence pixels";
+	std::cout << "; geometry rejected " << counters[3] << " STRONG/WEAK pixels";
 	std::cout << std::endl;
 	if (profile) {
-		std::cout << "Profile freeze GPU confidence and geometry: "
+		std::cout << "Profile geometry-consistent freeze GPU: "
 			<< std::chrono::duration<double, std::milli>(
 				std::chrono::steady_clock::now() - update_start).count() << " ms\n";
 	}

@@ -80,13 +80,13 @@ enum PixelState {
 
 struct PatchMatchParams {
 	int max_iterations = 3;
-	int max_image_size = 3200; // 0 keeps input resolution.
+	int max_image_size = 1800; // 0 keeps input resolution.
 	bool geometric_anchor_cost = false; // Opt-in experimental replacement of anchor NCC.
-	bool adaptive_refinement = false; // Skip fine-scale PatchMatch updates on stable planar strong pixels.
+	bool adaptive_refinement = true; // Master switch for geometry-consistent planar freezing.
 	int adaptive_refinement_aggressiveness = 1; // 1=conservative, 2=balanced, 3=aggressive planar consensus.
 	// Freeze complete flat parent regions at the next pyramid level and keep
 	// one representative point per frozen region during final fusion.
-	bool adaptive_geometry_density = false;
+	bool adaptive_geometry_density = true;
 	// Compact all checkerboard/active kernels to the unfrozen region. This is
 	// the regional pyramid mode: frozen planar children remain logical leaves
 	// and do not receive PatchMatch work at the finer scale.

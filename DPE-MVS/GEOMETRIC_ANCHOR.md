@@ -29,7 +29,7 @@ seeds/settings and compare depth error/completeness plus stage runtime.
 
 ## Maximum image size
 
-Default longest edge is now 3200; use `--max-image-size 0` for original resolution.
+Default longest edge is now 1800; use `--max-image-size 0` for original resolution.
 Example: `build-max-size/DPE INPUT 0 --geometric-anchor-cost --max-image-size 3200`.
 Resizing is in memory, preserving original images/cameras. Never upscales. Intrinsics
 use actual rounded width/height ratios. Pyramid edges and input processing use the
