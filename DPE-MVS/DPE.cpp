@@ -1783,10 +1783,10 @@ PlanePatchMap BuildPlanePatchMap(const cv::Mat &depth, const cv::Mat &normal,
 }
 
 // ETH version
-void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride,
+void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int fusion_simple_region_stride,
 		bool plane_fusion, int plane_sample_stride, bool adaptive_geometry_density)
 {
-	if (simple_region_stride < 1) throw std::invalid_argument("simple_region_stride must be >= 1");
+	if (fusion_simple_region_stride < 1) throw std::invalid_argument("fusion_simple_region_stride must be >= 1");
 	if (plane_sample_stride < 1) throw std::invalid_argument("plane_sample_stride must be >= 1");
 	int num_images = problems.size();
 	path image_folder = dense_folder / path("images");
@@ -1854,7 +1854,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	
 		cv::Mat scaled_image;
 		RescaleImageAndCamera(image, scaled_image, depth, camera);
-		if ((plane_fusion || simple_region_stride > 1) && normal.size() != depth.size())
+		if ((plane_fusion || fusion_simple_region_stride > 1) && normal.size() != depth.size())
 			cv::resize(normal, normal, depth.size(), 0, 0, cv::INTER_NEAREST);
 		images.emplace_back(scaled_image);
 		cameras.emplace_back(camera);
@@ -2131,8 +2131,8 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 				float ref_depth = depths[ref_index].at<float>(r, c);
 				if (!IsFiniteFloat(ref_depth) || ref_depth <= 0.0f)
 					continue;
-				if (simple_region_stride > 1 &&
-					((r % simple_region_stride) != 0 || (c % simple_region_stride) != 0)) {
+				if (fusion_simple_region_stride > 1 &&
+					((r % fusion_simple_region_stride) != 0 || (c % fusion_simple_region_stride) != 0)) {
 					++simple_candidates;
 					if (IsStablePlanarNeighbourhood(depths[ref_index], normals[ref_index], cv::Mat(), cameras[ref_index], r, c)) {
 						++simple_points_skipped;
@@ -2213,8 +2213,8 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	}
 	std::cout << "Saved " << PointCloud.size() << " points with normals to "
 		<< fused_path.string() << std::endl;
-	if (simple_region_stride > 1) {
-		std::cout << "Adaptive point sampling (stride " << simple_region_stride << "): skipped "
+	if (fusion_simple_region_stride > 1) {
+		std::cout << "Fusion adaptive point sampling (stride " << fusion_simple_region_stride << "): skipped "
 			<< simple_points_skipped << " planar pixels / " << simple_candidates << " off-grid pixels checked ("
 			<< (100.0 * simple_points_skipped / std::max<uint64_t>(1, simple_candidates)) << "%)." << std::endl;
 	}

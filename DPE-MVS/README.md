@@ -79,9 +79,9 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   its COLMAP image ID and source image name. These maps can be used later for
   source-image visibility checks without rerunning PatchMatch.
 
-- Geometry-aware adaptive refinement and optional point sampling
+- Geometry-aware adaptive refinement and fusion point sampling
 >
-    ./DPE $data_folder 0 --adaptive-point-sampling --simple-region-stride 2
+    ./DPE $data_folder 0 --adaptive-point-sampling-fusion --simple-region-stride-fusion 2
 
   Geometry-consistent freezing is enabled by default. At each scale boundary,
   STRONG and WEAK pixels are candidates, but freeze only when their plane agrees
@@ -136,8 +136,8 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   outer passes for one reference image at the current scale once at least 85%
   of its pixels are frozen. Active pixels then receive fewer updates, so this
   option is a stronger speed/quality trade-off; the default is disabled.
-  `--adaptive-point-sampling` applies the
-  same local plane test during fusion and samples accepted planar regions on a
+  `--adaptive-point-sampling-fusion` applies the same local plane test during
+  fusion and samples accepted planar regions on a
   regular grid; stride 2 keeps one quarter of those planar candidates while
   retaining all candidates in locally complex areas. This additional sampling
   option remains off by default; the geometry-aware frozen-parent fusion above

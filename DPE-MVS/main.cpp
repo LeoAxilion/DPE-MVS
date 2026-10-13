@@ -281,7 +281,7 @@ int main(int argc, char **argv) {
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
 						 "[--no-compact-active-worklists] "
-					 "[--adaptive-point-sampling] [--simple-region-stride N] "
+					 "[--adaptive-point-sampling-fusion] [--simple-region-stride-fusion N] "
 						 "[--plane-fusion] [--plane-sample-stride N] "
 						 "[--min-pyramid-levels N] "
 						 "[--pyramid-levels N] "
@@ -297,8 +297,8 @@ int main(int argc, char **argv) {
 	float adaptive_refinement_early_stop = 0.0f;
 	bool adaptive_geometry_density = true;
 	bool compact_active_worklists = true;
-    bool adaptive_point_sampling = false;
-    int simple_region_stride = 2;
+    bool fusion_adaptive_point_sampling = false;
+    int fusion_simple_region_stride = 2;
     bool plane_fusion = false;
     int plane_sample_stride = 4;
     int min_pyramid_levels = 1;
@@ -340,7 +340,7 @@ int main(int argc, char **argv) {
                     adaptive_refinement_early_stop <= 1.0f))
                     throw std::invalid_argument("adaptive-refinement-early-stop must be between 0 and 1");
             }
-            else if (option == "--adaptive-point-sampling") adaptive_point_sampling = true;
+			else if (option == "--adaptive-point-sampling-fusion") fusion_adaptive_point_sampling = true;
 			else if (option == "--plane-fusion") plane_fusion = true;
 			else if (option == "--plane-sample-stride" && arg < argc) {
 				const std::string value(argv[arg++]);
@@ -349,12 +349,12 @@ int main(int argc, char **argv) {
 				if (end != value.size() || plane_sample_stride < 1)
 					throw std::invalid_argument("plane-sample-stride must be >= 1");
 			}
-            else if (option == "--simple-region-stride" && arg < argc) {
+			else if (option == "--simple-region-stride-fusion" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
-                simple_region_stride = std::stoi(value, &end);
-                if (end != value.size() || simple_region_stride < 1)
-                    throw std::invalid_argument("simple-region-stride must be >= 1");
+                fusion_simple_region_stride = std::stoi(value, &end);
+                if (end != value.size() || fusion_simple_region_stride < 1)
+					throw std::invalid_argument("simple-region-stride-fusion must be >= 1");
             }
             else if (option == "--min-pyramid-levels" && arg < argc) {
 				if (exact_pyramid_levels_explicit)
@@ -418,8 +418,8 @@ int main(int argc, char **argv) {
 	std::cout << "Compact active-pixel GPU worklists: " << compact_active_worklists
 		<< " (frozen pixels " << (compact_active_worklists ? "excluded" : "included")
 		<< " from per-pixel launches)" << std::endl;
-    std::cout << "Adaptive point sampling: " << adaptive_point_sampling
-	          << " (simple-region stride " << simple_region_stride << ")" << std::endl;
+	std::cout << "Fusion adaptive point sampling: " << fusion_adaptive_point_sampling
+		<< " (simple-region stride " << fusion_simple_region_stride << ")" << std::endl;
 	std::cout << "Plane fusion: " << plane_fusion << " (sample stride " << plane_sample_stride << ")" << std::endl;
 	if (exact_pyramid_levels > 0)
 		std::cout << "Exact pyramid levels: " << exact_pyramid_levels << std::endl;
@@ -437,7 +437,8 @@ int main(int argc, char **argv) {
 			std::cerr << "Fusion inputs are incomplete. Run depth estimation first." << std::endl;
 			return EXIT_FAILURE;
 		}
-		RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
+		RunFusion(dense_folder, problems,
+			fusion_adaptive_point_sampling ? fusion_simple_region_stride : 1,
 			plane_fusion, plane_sample_stride, adaptive_geometry_density);
 		std::cout << "Fusion done. Intermediate depth and normal files were preserved.\n";
 		print_total_elapsed();
@@ -569,7 +570,8 @@ int main(int argc, char **argv) {
 		std::cout << "Round: " << i << " done\n";
 	}
 
-	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
+	RunFusion(dense_folder, problems,
+		fusion_adaptive_point_sampling ? fusion_simple_region_stride : 1,
 		plane_fusion, plane_sample_stride, adaptive_geometry_density);
 	{// delete files
 		for (size_t i = 0; i < problems.size(); ++i) {

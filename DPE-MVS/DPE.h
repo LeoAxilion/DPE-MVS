@@ -56,7 +56,7 @@ template <typename TYPE>
 void RescaleMatToTargetSize(const cv::Mat &src, cv::Mat &dst, const cv::Size2i &target_size);
 
 void RunFusion(const path &dense_folder, const std::vector<Problem> &problems,
-	int simple_region_stride = 1, bool plane_fusion = false, int plane_sample_stride = 4,
+	int fusion_simple_region_stride = 1, bool plane_fusion = false, int plane_sample_stride = 4,
 	bool adaptive_geometry_density = false);
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems);
 void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem> &problems);
