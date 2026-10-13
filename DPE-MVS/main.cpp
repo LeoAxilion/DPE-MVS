@@ -5,7 +5,7 @@
 using namespace boost::filesystem;
 
 void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems,
-	bool show_medium_result)
+	bool show_medium_result, int max_source_images)
 {
 	path cluster_list_path = dense_folder / path("pair.txt");
 	problems.clear();
@@ -38,6 +38,7 @@ void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems
 		std::getline(file, line);
 		iss.str(line);
 		iss >> num_src_images;
+		std::vector<std::pair<float, int>> scored_sources;
 		for (int j = 0; j < num_src_images; ++j) {
 			int id;
 			float score;
@@ -45,7 +46,20 @@ void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems
 			if (score <= 0.0f) {
 				continue;
 			}
-			problem.src_image_ids.push_back(id);
+			if (max_source_images > 0)
+				scored_sources.emplace_back(score, id);
+			else
+				problem.src_image_ids.push_back(id);
+		}
+		if (max_source_images > 0) {
+			std::stable_sort(scored_sources.begin(), scored_sources.end(),
+				[](const std::pair<float, int> &a, const std::pair<float, int> &b) {
+					return a.first > b.first;
+				});
+			const size_t keep = std::min(scored_sources.size(),
+				static_cast<size_t>(max_source_images));
+			for (size_t j = 0; j < keep; ++j)
+				problem.src_image_ids.push_back(scored_sources[j].second);
 		}
 		problems.push_back(problem);
 	}
@@ -276,6 +290,7 @@ int main(int argc, char **argv) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
                      "[--geometric-anchor-cost] "
 					 "[--max-image-size N] "
+					 "[--max-source-images N (default 10; <=0 uses up to 31)] "
                      "[--show-medium-result] "
 					 "[--no-adaptive-geometry-density] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
@@ -289,7 +304,7 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
-    int gpu_index = 0, max_image_size = 1800;
+    int gpu_index = 0, max_image_size = 1800, max_source_images = 10;
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
     bool show_medium_result = false;
@@ -388,6 +403,20 @@ int main(int argc, char **argv) {
                 size_t end = 0;
                 max_image_size = std::stoi(value, &end);
                 if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
+            } else if (option == "--max-source-images" && arg < argc) {
+                const std::string value(argv[arg++]);
+                size_t end = 0;
+                try {
+                    max_source_images = std::stoi(value, &end);
+                } catch (const std::exception &) {
+                    throw std::invalid_argument("max-source-images must be an integer; values <= 0 use the program limit of " +
+                        std::to_string(MAX_IMAGES - 1));
+                }
+                if (end != value.size() || max_source_images >= MAX_IMAGES)
+                    throw std::invalid_argument("positive max-source-images must be between 1 and " +
+                        std::to_string(MAX_IMAGES - 1) + "; values <= 0 use the program limit");
+                if (max_source_images <= 0)
+                    max_source_images = MAX_IMAGES - 1;
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
 		compact_active_worklists = compact_active_worklists && adaptive_geometry_density;
@@ -402,7 +431,18 @@ int main(int argc, char **argv) {
     std::cout << "Maximum image size: " << max_image_size << " (0 = original)" << std::endl;
 	// generate problems
 	std::vector<Problem> problems;
-	GenerateSampleList(dense_folder, problems, show_medium_result);
+	GenerateSampleList(dense_folder, problems, show_medium_result, max_source_images);
+	if (max_source_images > 0) {
+		size_t min_sources = static_cast<size_t>(max_source_images);
+		size_t max_sources = 0;
+		for (const auto &problem : problems) {
+			min_sources = std::min(min_sources, problem.src_image_ids.size());
+			max_sources = std::max(max_sources, problem.src_image_ids.size());
+		}
+		std::cout << "Maximum source images per reference: " << max_source_images
+			<< " (retained " << min_sources << "-" << max_sources
+			<< " positive-score sources per reference, ranked by pair.txt score)" << std::endl;
+	}
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
         problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
