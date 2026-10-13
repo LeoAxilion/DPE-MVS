@@ -24,38 +24,6 @@ bool IsValidNormal(const cv::Vec3f &normal) {
 	return IsFiniteFloat(length_squared) && length_squared > 1e-12f;
 }
 
-void ValidateTexturePairPrior(const cv::Mat &prior, int num_sources, const path &prior_path,
-		bool global_view_ids = false, int reference_view_id = -1) {
-	uint64_t invalid_view_ids = 0;
-	uint64_t reference_without_partner = 0;
-	const auto valid = [num_sources, global_view_ids, reference_view_id](int view) {
-		if (view == -2 || view == -1) return true;
-		return view >= 0 && view < num_sources && (!global_view_ids || view != reference_view_id);
-	};
-	for (int row = 0; row < prior.rows; ++row) {
-		const cv::Vec2i *values = prior.ptr<cv::Vec2i>(row);
-		for (int col = 0; col < prior.cols; ++col) {
-			const int first = values[col][0];
-			const int second = values[col][1];
-			if (!valid(first) || !valid(second) ||
-				(first >= 0 && first == second) || (first == -2 && second == -2)) {
-				++invalid_view_ids;
-				continue;
-			}
-			if ((first == -2 && second < 0) || (second == -2 && first < 0)) {
-				++reference_without_partner;
-			}
-		}
-	}
-	if (invalid_view_ids || reference_without_partner) {
-		throw std::runtime_error("Invalid TexRecon two-view prior " + prior_path.string() +
-			": " + std::to_string(invalid_view_ids) + " pixels contain out-of-range or duplicate views; " +
-			std::to_string(reference_without_partner) +
-			" pixels select the reference but have no loaded partner. DPE would reject all sources "
-			"for those pixels; regenerate the prior with complete partner coverage.");
-	}
-}
-
 int RepresentativeCoordinate(int source_coordinate, int source_length, int target_length) {
 	return static_cast<int>(((2LL * source_coordinate + 1) * target_length) /
 		(2LL * source_length));
@@ -942,7 +910,6 @@ DPE::~DPE() {
 	cudaFree(costs_cuda);
 	cudaFree(rand_states_cuda);
 	cudaFree(selected_views_cuda);
-	cudaFree(texture_view_pair_prior_cuda);
 	cudaFree(params_cuda);
 	cudaFree(helper_cuda);
 	cudaFree(neighbours_cuda);
@@ -1128,20 +1095,6 @@ void DPE::InuputInitialization() {
 	// =================================================
 	plane_hypotheses_host = new float4[cameras[0].height * cameras[0].width];
 	selected_views_host = cv::Mat::zeros(height, width, CV_32SC1);
-	if (params_host.texture_view_pair_prior) {
-		const path pair_path = problem.result_folder / path("texture_view_pair_prior.dmb");
-		if (!exists(pair_path))
-			throw std::runtime_error("Missing TexRecon two-view prior: " + pair_path.string());
-		if (!ReadBinMat(pair_path, texture_view_pair_prior_host) ||
-			texture_view_pair_prior_host.type() != CV_32SC2)
-			throw std::runtime_error("Invalid TexRecon two-view prior: " + pair_path.string());
-		if (texture_view_pair_prior_host.cols != width || texture_view_pair_prior_host.rows != height) {
-			cv::resize(texture_view_pair_prior_host, texture_view_pair_prior_host,
-				cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
-		}
-		ValidateTexturePairPrior(texture_view_pair_prior_host,
-			static_cast<int>(problem.src_image_ids.size()), pair_path);
-	}
 	if (params_host.state != FIRST_INIT) {
 		// input plane hypotheses from existed result
 		path depth_path = problem.result_folder / path("depths.dmb");
@@ -1234,11 +1187,6 @@ void DPE::CudaSpaceInitialization() {
 	// malloc for selected_views
 	CUDA_SAFE_CALL(cudaMalloc((void**)&selected_views_cuda, sizeof(unsigned int) * length));
 	CUDA_SAFE_CALL(cudaMemcpy(selected_views_cuda, selected_views_host.ptr<unsigned int>(0), sizeof(unsigned int) * length, cudaMemcpyHostToDevice));
-	if (params_host.texture_view_pair_prior) {
-		CUDA_SAFE_CALL(cudaMalloc((void**)&texture_view_pair_prior_cuda, sizeof(int2) * length));
-		CUDA_SAFE_CALL(cudaMemcpy(texture_view_pair_prior_cuda, texture_view_pair_prior_host.ptr<cv::Vec2i>(0),
-			sizeof(int2) * length, cudaMemcpyHostToDevice));
-	}
 	// view weight
 	CUDA_SAFE_CALL(cudaMalloc((void**)&view_weight_cuda, sizeof(uchar) * length * MAX_IMAGES));
 	// move plane hypotheses to gpu
@@ -1473,7 +1421,6 @@ void DPE::SetDataPassHelperInCuda() {
 	helper_host.plane_hypotheses_cuda = this->plane_hypotheses_cuda;
 	helper_host.rand_states_cuda = this->rand_states_cuda;
 	helper_host.selected_views_cuda = this->selected_views_cuda;
-	helper_host.texture_view_pair_prior_cuda = this->texture_view_pair_prior_cuda;
 	helper_host.weak_info_cuda = this->weak_info_cuda;
 	helper_host.params = params_cuda;
 	helper_host.debug_point = make_int2(DEBUG_POINT_X, DEBUG_POINT_Y);
@@ -1837,13 +1784,10 @@ PlanePatchMap BuildPlanePatchMap(const cv::Mat &depth, const cv::Mat &normal,
 
 // ETH version
 void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, int simple_region_stride,
-		bool plane_fusion, int plane_sample_stride, bool texture_view_pair_prior,
-		bool global_texture_view_pair_prior, bool adaptive_geometry_density)
+		bool plane_fusion, int plane_sample_stride, bool adaptive_geometry_density)
 {
 	if (simple_region_stride < 1) throw std::invalid_argument("simple_region_stride must be >= 1");
 	if (plane_sample_stride < 1) throw std::invalid_argument("plane_sample_stride must be >= 1");
-	if (texture_view_pair_prior && global_texture_view_pair_prior)
-		throw std::invalid_argument("local matching prior and global fusion-only prior cannot be combined");
 	int num_images = problems.size();
 	path image_folder = dense_folder / path("images");
 	path cam_folder = dense_folder / path("cams");
@@ -1856,7 +1800,6 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	std::vector<cv::Mat> blocks;
 	std::vector<cv::Mat> weaks;
 	std::vector<cv::Mat> density_keeps;
-	std::vector<cv::Mat> texture_view_pairs;
 	images.clear();
 	cameras.clear();
 	depths.clear();
@@ -1865,7 +1808,6 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	blocks.clear();
 	weaks.clear();
 	density_keeps.clear();
-	texture_view_pairs.clear();
 	std::unordered_map<int, int> imageIdToindexMap;
 
 	path block_folder = dense_folder / path("blocks");
@@ -1902,24 +1844,6 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 		} else {
 			density_keeps.emplace_back();
 		}
-		if (texture_view_pair_prior || global_texture_view_pair_prior) {
-			const path pair_path = problem.result_folder / path("texture_view_pair_prior.dmb");
-			cv::Mat pair_map;
-			if (!ReadBinMat(pair_path, pair_map) || pair_map.type() != CV_32SC2)
-				throw std::runtime_error("Missing or invalid TexRecon two-view prior: " + pair_path.string());
-			if (pair_map.size() != depth.size())
-				cv::resize(pair_map, pair_map, depth.size(), 0, 0, cv::INTER_NEAREST);
-			if (global_texture_view_pair_prior) {
-				ValidateTexturePairPrior(pair_map, num_images, pair_path, true, problem.ref_image_id);
-			} else {
-				ValidateTexturePairPrior(pair_map,
-					static_cast<int>(problem.src_image_ids.size()), pair_path);
-			}
-			texture_view_pairs.emplace_back(std::move(pair_map));
-		} else {
-			texture_view_pairs.emplace_back();
-		}
-	
 		if (use_block) {
 			path block_path = block_folder / path("mask_" + std::to_string(problem.ref_image_id) + ".jpg");
 			cv::Mat block_jpg = cv::imread(block_path.string(), cv::IMREAD_GRAYSCALE);
@@ -1941,10 +1865,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 		RescaleMatToTargetSize<uchar>(weak, weak, cv::Size2i(depth.cols, depth.rows));
 		weaks.emplace_back(weak);
 	}
-	if (plane_fusion && (texture_view_pair_prior || global_texture_view_pair_prior)) {
-		std::cout << "TexRecon per-pixel view pairs require pixel-level validation; using standard fusion instead of plane fusion.\n";
-	}
-	if (plane_fusion && !texture_view_pair_prior && !global_texture_view_pair_prior) {
+	if (plane_fusion) {
 		if (plane_sample_stride < 1)
 			throw std::invalid_argument("plane fusion sample stride must be >= 1");
 		const auto segmentation_start = std::chrono::steady_clock::now();
@@ -2184,7 +2105,6 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	PointCloud.clear();
 	uint64_t simple_candidates = 0;
 	uint64_t simple_points_skipped = 0;
-	uint64_t pair_prior_pixels_rejected = 0;
 	uint64_t density_pixels_skipped = 0;
 
 	for (int i = 0; i < num_images; ++i) {
@@ -2199,23 +2119,6 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 				if (adaptive_geometry_density && density_keeps[ref_index].at<uchar>(r, c) == 0) {
 					++density_pixels_skipped;
 					continue;
-				}
-				cv::Vec2i pair(-1, -1);
-				int pair_partner_index = -1;
-				if (texture_view_pair_prior || global_texture_view_pair_prior) {
-					pair = texture_view_pairs[ref_index].at<cv::Vec2i>(r, c);
-					if (pair[0] != -2 && pair[1] != -2) {
-						++pair_prior_pixels_rejected;
-						continue;
-					}
-					if (global_texture_view_pair_prior) {
-						const int partner_id = pair[0] == -2 ? pair[1] : pair[0];
-					const auto partner = imageIdToindexMap.find(partner_id);
-					if (partner == imageIdToindexMap.end())
-						throw std::runtime_error("TexRecon fusion prior references an image not loaded as a reference: " +
-							std::to_string(partner_id));
-					pair_partner_index = partner->second;
-				}
 				}
 				if (use_block && blocks[ref_index].at<uchar>(r, c) < 128) {
 					continue;
@@ -2242,16 +2145,10 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 				float3 consistent_Point = PointX;
 				int num_consistent = 0;
 				float dynamic_consistency = 0.0f;
-				const int candidate_count = global_texture_view_pair_prior ? 1 : num_ngb;
+				const int candidate_count = num_ngb;
 				std::vector<int2> used_list(candidate_count, make_int2(-1, -1));
 				for (int j = 0; j < candidate_count; ++j) {
-					int src_index;
-					if (global_texture_view_pair_prior) {
-						src_index = pair_partner_index;
-					} else {
-						if (texture_view_pair_prior && pair[0] != j && pair[1] != j) continue;
-						src_index = imageIdToindexMap[problem.src_image_ids[j]];
-					}
+					const int src_index = imageIdToindexMap[problem.src_image_ids[j]];
 					const int src_cols = depths[src_index].cols;
 					const int src_rows = depths[src_index].rows;
 					float2 point;
@@ -2292,8 +2189,7 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 					for (int j = 0; j < candidate_count; ++j) {
 						if (used_list[j].x == -1)
 							continue;
-						const int src_index = global_texture_view_pair_prior ? pair_partner_index :
-							imageIdToindexMap[problem.src_image_ids[j]];
+						const int src_index = imageIdToindexMap[problem.src_image_ids[j]];
 						masks[src_index].at<uchar>(used_list[j].y, used_list[j].x) = 1;
 						const auto &color = images[src_index].at<cv::Vec3b>(used_list[j].y, used_list[j].x);
 						consistent_Color[0] += color[0];
@@ -2317,10 +2213,6 @@ void RunFusion(const path &dense_folder, const std::vector<Problem> &problems, i
 	}
 	std::cout << "Saved " << PointCloud.size() << " points with normals to "
 		<< fused_path.string() << std::endl;
-	if (texture_view_pair_prior) {
-		std::cout << "TexRecon pair prior rejected " << pair_prior_pixels_rejected
-			<< " pixels because the reference image was not among the selected two views.\n";
-	}
 	if (simple_region_stride > 1) {
 		std::cout << "Adaptive point sampling (stride " << simple_region_stride << "): skipped "
 			<< simple_points_skipped << " planar pixels / " << simple_candidates << " off-grid pixels checked ("

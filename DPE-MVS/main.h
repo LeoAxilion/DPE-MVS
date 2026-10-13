@@ -88,7 +88,6 @@ struct PatchMatchParams {
 	// Compact per-pixel GPU worklists to unfrozen pixels, including checkerboard
 	// kernels. When false, full-grid launches also assign threads to frozen pixels.
 	bool compact_active_worklists = true;
-	bool texture_view_pair_prior = false; // Restrict each pixel to its two TexRecon-selected views.
 	int num_images = 5;
 	float sigma_spatial = 5.0f;
 	float sigma_color = 3.0f;
