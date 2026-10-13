@@ -280,7 +280,7 @@ int main(int argc, char **argv) {
 					 "[--no-adaptive-geometry-density] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
 					 "[--adaptive-refinement-early-stop FRACTION] "
-						 "[--regional-adaptive-pyramid] "
+						 "[--no-compact-active-worklists] "
 					 "[--texture-view-pair-prior] "
 					 "[--texture-view-pair-fusion-prior] "
 					 "[--adaptive-point-sampling] [--simple-region-stride N] "
@@ -295,12 +295,10 @@ int main(int argc, char **argv) {
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
     bool show_medium_result = false;
-    bool adaptive_refinement = true;
     int adaptive_refinement_aggressiveness = 1;
 	float adaptive_refinement_early_stop = 0.0f;
 	bool adaptive_geometry_density = true;
-	bool disable_adaptive_geometry_density = false;
-	bool regional_adaptive_pyramid = false;
+	bool compact_active_worklists = true;
 	bool texture_view_pair_prior = false;
 	bool texture_view_pair_fusion_prior = false;
     bool adaptive_point_sampling = false;
@@ -327,8 +325,9 @@ int main(int argc, char **argv) {
 			}
 			else if (option == "--no-adaptive-refinement" ||
 				option == "--no-adaptive-geometry-density")
-				disable_adaptive_geometry_density = true;
-			else if (option == "--regional-adaptive-pyramid") regional_adaptive_pyramid = true;
+				adaptive_geometry_density = false;
+			else if (option == "--no-compact-active-worklists")
+				compact_active_worklists = false;
 			else if (option == "--texture-view-pair-prior") texture_view_pair_prior = true;
 			else if (option == "--texture-view-pair-fusion-prior") texture_view_pair_fusion_prior = true;
             else if (option == "--adaptive-refinement-aggressiveness" && arg < argc) {
@@ -397,11 +396,8 @@ int main(int argc, char **argv) {
                 if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
-		adaptive_geometry_density = !disable_adaptive_geometry_density;
-		adaptive_refinement = adaptive_geometry_density;
-		if (regional_adaptive_pyramid && !adaptive_geometry_density)
-			throw std::invalid_argument("--regional-adaptive-pyramid requires geometry-consistent freezing; remove --no-adaptive-geometry-density");
-		if (adaptive_refinement_early_stop > 0.0f && !adaptive_refinement)
+		compact_active_worklists = compact_active_worklists && adaptive_geometry_density;
+		if (adaptive_refinement_early_stop > 0.0f && !adaptive_geometry_density)
 			throw std::invalid_argument("adaptive-refinement-early-stop requires geometry-consistent freezing; remove --no-adaptive-geometry-density");
 		if (texture_view_pair_prior && texture_view_pair_fusion_prior)
 			throw std::invalid_argument("use either --texture-view-pair-prior or --texture-view-pair-fusion-prior");
@@ -419,21 +415,20 @@ int main(int argc, char **argv) {
 	GenerateSampleList(dense_folder, problems, show_medium_result);
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;
-        problem.params.adaptive_refinement = adaptive_refinement;
         problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
 		problem.params.adaptive_geometry_density = adaptive_geometry_density;
-		problem.params.regional_adaptive_pyramid = regional_adaptive_pyramid;
+		problem.params.compact_active_worklists = compact_active_worklists;
 		problem.params.texture_view_pair_prior = texture_view_pair_prior;
         problem.params.max_image_size = max_image_size;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
-	std::cout << "Geometry-consistent adaptive freezing: " << adaptive_refinement << " (aggressiveness "
-		<< adaptive_refinement_aggressiveness << ", early-stop threshold "
-		<< adaptive_refinement_early_stop << ")" << std::endl;
-	std::cout << "Adaptive geometry density: " << adaptive_geometry_density
-		<< " (flat parents freeze complete child regions; one point retained per parent)" << std::endl;
-	std::cout << "Regional adaptive pyramid: " << regional_adaptive_pyramid
-		<< " (compact checkerboard worklists for active detail regions)" << std::endl;
+	std::cout << "Geometry-consistent adaptive freezing and density: " << adaptive_geometry_density
+		<< " (aggressiveness " << adaptive_refinement_aggressiveness << ", early-stop threshold "
+		<< adaptive_refinement_early_stop
+		<< "; flat parents freeze complete child regions and retain one fusion point)" << std::endl;
+	std::cout << "Compact active-pixel GPU worklists: " << compact_active_worklists
+		<< " (frozen pixels " << (compact_active_worklists ? "excluded" : "included")
+		<< " from per-pixel launches)" << std::endl;
 	std::cout << "TexRecon two-view prior: " << texture_view_pair_prior << std::endl;
 	std::cout << "TexRecon fusion-only two-view prior: " << texture_view_pair_fusion_prior << std::endl;
     std::cout << "Adaptive point sampling: " << adaptive_point_sampling
@@ -491,7 +486,7 @@ int main(int argc, char **argv) {
 		std::fill(early_stopped.begin(), early_stopped.end(), false);
 		for (auto &problem : problems) {
 			problem.iteration = iteration_index;
-			problem.update_adaptive_mask = adaptive_refinement &&
+			problem.update_adaptive_mask = adaptive_geometry_density &&
 				((problem.iteration % 4 == 3) && (i + 1 < round_num));
 			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 			problem.params.scale_size = problem.scale_size;
@@ -530,7 +525,7 @@ int main(int argc, char **argv) {
 					continue;
 				}
 				problem.iteration = iteration_index;
-				problem.update_adaptive_mask = adaptive_refinement &&
+				problem.update_adaptive_mask = adaptive_geometry_density &&
 					((problem.iteration % 4 == 3) && (i + 1 < round_num));
 				problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
 				problem.params.scale_size = problem.scale_size;
@@ -563,12 +558,12 @@ int main(int argc, char **argv) {
 		}
 		// Persist once per completed scale, including images that stopped early.
 		// --start-round can reload these checkpoints in a fresh process.
-		if (adaptive_refinement) {
+		if (adaptive_geometry_density) {
 			for (const auto &problem : problems) {
 				const auto &state = *problem.adaptive_state;
 				WriteBinMat(problem.result_folder / "adaptive_frozen.dmb", state.mask);
 				WriteBinMat(problem.result_folder / "adaptive_stability.dmb", state.stability);
-				if (adaptive_geometry_density && !state.density_keep.empty())
+				if (!state.density_keep.empty())
 					WriteBinMat(problem.result_folder / "adaptive_density_keep.dmb", state.density_keep);
 			}
 		}

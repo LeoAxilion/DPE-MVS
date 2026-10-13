@@ -19,7 +19,7 @@ __device__ int2 WorkPixel(const DataPassHelper *helper) {
 		blockIdx.y * blockDim.y + threadIdx.y);
 }
 
-// Checkerboard propagation has separate black/red passes. In regional mode
+// Checkerboard propagation has separate black/red passes. In compact mode
 // each pass receives a compact list containing only active pixels of that
 // color, so frozen planar leaves do not occupy checkerboard threads.
 template <bool Compact, bool Black>
@@ -1116,6 +1116,7 @@ __device__ float ComputeShapeConsistencyCost(
 	return min(max_cost, shape_cost);
 }
 
+template <bool Compact>
 __global__ void InitRandomStates(
 	DataPassHelper *helper
 ) {
@@ -1123,7 +1124,7 @@ __global__ void InitRandomStates(
 	const int height = helper->height;
 	curandState *rand_states = helper->rand_states_cuda;
 
-	const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+	const int2 p = WorkPixel<Compact>(helper);
 	if (p.x >= width || p.y >= height) {
 		return;
 	}
@@ -3378,11 +3379,11 @@ void DPE::RunPatchMatch() {
 	block_size_full.x = 16;
 	block_size_full.y = 16;
 	block_size_full.z = 1;
-	const bool use_active_worklist = params_host.adaptive_refinement &&
+	const bool use_active_worklist = params_host.adaptive_geometry_density &&
 		active_pixel_count < width * height;
 	dim3 grid_size_active((active_pixel_count + 255) / 256, 1, 1);
 	const bool use_compact_checkerboard = use_active_worklist &&
-		params_host.regional_adaptive_pyramid;
+		params_host.compact_active_worklists;
 	dim3 grid_size_active_black((active_pixel_black_count + 255) / 256, 1, 1);
 	dim3 grid_size_active_red((active_pixel_red_count + 255) / 256, 1, 1);
 	if (use_active_worklist)
@@ -3401,7 +3402,12 @@ void DPE::RunPatchMatch() {
 	block_size_half.y = BLOCK_H;
 	block_size_half.z = 1;
 
-	InitRandomStates << <grid_size_full, block_size_full >> >(helper_cuda);
+	if (use_active_worklist) {
+		if (active_pixel_count > 0)
+			InitRandomStates<true> << <grid_size_active, block_size_full >> >(helper_cuda);
+	} else {
+		InitRandomStates<false> << <grid_size_full, block_size_full >> >(helper_cuda);
+	}
 	CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
 	if (use_compact_checkerboard) {

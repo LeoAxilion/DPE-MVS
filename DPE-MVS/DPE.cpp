@@ -1273,15 +1273,14 @@ void DPE::CudaSpaceInitialization() {
 	if (problem.params.use_radius) {
 		CUDA_SAFE_CALL(cudaMalloc((void**)(&radius_cuda), length * sizeof(int)));
 	}
-	if (params_host.adaptive_refinement) {
+	if (params_host.adaptive_geometry_density) {
 		CUDA_SAFE_CALL(cudaMalloc((void**)(&adaptive_refinement_mask_cuda), length * sizeof(uchar)));
 		CUDA_SAFE_CALL(cudaMemcpy(adaptive_refinement_mask_cuda, adaptive_refinement_mask_host.ptr<uchar>(0),
 			length * sizeof(uchar), cudaMemcpyHostToDevice));
 		CUDA_SAFE_CALL(cudaMalloc((void**)(&adaptive_freeze_counters_cuda), 4 * sizeof(int)));
 		CUDA_SAFE_CALL(cudaMemset(adaptive_freeze_counters_cuda, 0, 4 * sizeof(int)));
 		active_pixel_count = length;
-		const bool use_compact_lists = params_host.regional_adaptive_pyramid ||
-			adaptive_frozen_fraction >= 0.25f;
+		const bool use_compact_lists = params_host.compact_active_worklists;
 		if (use_compact_lists &&
 			cv::countNonZero(adaptive_refinement_mask_host) < length) {
 			std::vector<int> active_pixels;
@@ -1381,7 +1380,7 @@ void DPE::SupportInitialization() {
 		ReadBinMat(label_path, label_host);
 	}
 
-	if (!problem.params.adaptive_refinement) return;
+	if (!problem.params.adaptive_geometry_density) return;
 	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
 	auto profile_start = std::chrono::steady_clock::now();
 	const auto profile_stage = [&](const char *name) {
@@ -1518,7 +1517,7 @@ cv::Mat DPE::GetPixelStates() {
 }
 
 void DPE::UpdateGeometryConsistentAdaptiveMask() {
-	if (!problem.params.adaptive_refinement || !problem.params.adaptive_geometry_density ||
+	if (!problem.params.adaptive_geometry_density ||
 		adaptive_refinement_mask_host.empty() ||
 		!problem.update_adaptive_mask) return;
 	AdaptiveRefinementState &state = *problem.adaptive_state;

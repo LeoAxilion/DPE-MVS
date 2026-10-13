@@ -131,23 +131,28 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
   `adaptive_density_keep.dmb` files produced by a matching adaptive run; pass
   `--no-adaptive-geometry-density` to fuse older depth maps with the standard path.
 
+  Compact active-pixel GPU worklists are enabled by default, so frozen pixels
+  are omitted from per-pixel PatchMatch launches, including initialization and
+  checkerboard kernels. Use `--no-compact-active-worklists` to disable
+  compaction and restore full-grid thread assignment.
+
   The confidence state is read after `DepthToWeak`; the initial random-plane
-  setup is never used as a freeze decision. State is retained in memory between
+  setup is never used as a freeze decision. Frozen pixels are terminal in the
+  compact path and keep their last state. State is retained in memory between
   passes and checkpointed after each pyramid level, including images stopped
   early. `--start-round` reloads these completed level checkpoints. Neighbour
-  generation, neighbour updating, RANSAC plane fitting, and local refinement
-  use the active-pixel list once at least 25% of the pixels are frozen; below
-  that threshold they use the full image grid.
+  generation, neighbour updating, RANSAC plane fitting, local refinement,
+  checkerboard propagation, and confidence updates use active-pixel worklists
+  whenever frozen pixels exist. Disabling compaction restores full-grid launches.
   `--adaptive-refinement-aggressiveness` controls the plane-consensus threshold:
   level 1 requires 8/8 neighbors, 12-degree normal tolerance, and 1.25% relative
   depth tolerance; levels 2 and 3 relax these thresholds.
   The frozen mask stops depth/normal refinement and skips building an anchor
   list or fitting a plane for the frozen pixel itself. Frozen strong pixels
   remain available as anchors for active neighbours, and nearest-strong
-  lookup is retained where an active pixel may read it. The weak/strong
-  confidence state is still refreshed for fusion.
-  Frozen pixels use equal weights over their previously selected views for
-  this confidence check, since they do not regenerate propagation view weights.
+  lookup is retained where an active pixel may read it. Frozen pixels retain
+  their last weak/strong state because they no longer receive confidence-update
+  threads.
   Once pixels are frozen, anchor-neighbour preparation, fitted-plane generation,
   and `LocalRefine` launch from a compact list of active pixels instead of
   assigning one CUDA thread to every image pixel. Checkerboard propagation
