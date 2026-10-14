@@ -38,7 +38,7 @@ void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems
 		std::getline(file, line);
 		iss.str(line);
 		iss >> num_src_images;
-		std::vector<std::pair<float, int>> scored_sources;
+		std::vector<int> positive_sources;
 		for (int j = 0; j < num_src_images; ++j) {
 			int id;
 			float score;
@@ -46,21 +46,14 @@ void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems
 			if (score <= 0.0f) {
 				continue;
 			}
-			if (max_source_images > 0)
-				scored_sources.emplace_back(score, id);
-			else
-				problem.src_image_ids.push_back(id);
+			positive_sources.push_back(id);
 		}
-		if (max_source_images > 0) {
-			std::stable_sort(scored_sources.begin(), scored_sources.end(),
-				[](const std::pair<float, int> &a, const std::pair<float, int> &b) {
-					return a.first > b.first;
-				});
-			const size_t keep = std::min(scored_sources.size(),
-				static_cast<size_t>(max_source_images));
-			for (size_t j = 0; j < keep; ++j)
-				problem.src_image_ids.push_back(scored_sources[j].second);
-		}
+		// pair.txt is already ranked by score and source-view diversity. Preserve
+		// that order so the max-source-images limit does not undo the ranking.
+		const size_t keep = std::min(positive_sources.size(),
+			static_cast<size_t>(max_source_images));
+		for (size_t j = 0; j < keep; ++j)
+			problem.src_image_ids.push_back(positive_sources[j]);
 		problems.push_back(problem);
 	}
 }
@@ -441,7 +434,7 @@ int main(int argc, char **argv) {
 		}
 		std::cout << "Maximum source images per reference: " << max_source_images
 			<< " (retained " << min_sources << "-" << max_sources
-			<< " positive-score sources per reference, ranked by pair.txt score)" << std::endl;
+			<< " positive-score sources per reference, preserving pair.txt priority)" << std::endl;
 	}
 	for (auto &problem : problems) {
         problem.params.geometric_anchor_cost = geometric_anchor_cost;

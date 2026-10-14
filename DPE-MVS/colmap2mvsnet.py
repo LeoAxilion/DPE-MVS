@@ -295,12 +295,40 @@ def calc_score(inputs, images, points3d, extrinsic, args):
         # score += np.exp(-(theta - args.theta0) * (theta - args.theta0) / (2 * (args.sigma1 if theta <= args.theta0 else args.sigma2) ** 2))
         angles.append(theta)
         score += 1
+    triangulationangle = -1.0
     if len(angles) > 0:
         angles_sorted = sorted(angles)
         triangulationangle = angles_sorted[int(len(angles_sorted) * 0.75)]
         if triangulationangle < 1:
             score = 0.0
-    return i, j, score
+    return i, j, score, triangulationangle
+
+
+def rank_view_candidates(scores, triangulation_angle_matrix, max_candidates):
+    """Rank diverse positive-score sources before redundant and zero-score ones.
+
+    Scores remain the primary ordering. A lower-score positive candidate is
+    deferred if its 75th-percentile triangulation angle to any higher-score
+    preferred candidate is below one degree. Deferred candidates are not used
+    as references for later comparisons. They retain their score and are placed
+    after all preferred positive candidates, but before zero-score candidates.
+    """
+    score_order = sorted(range(len(scores)), key=lambda image_id: (-scores[image_id], image_id))
+    positive = [image_id for image_id in score_order if scores[image_id] > 0]
+    zero_score = [image_id for image_id in score_order if scores[image_id] <= 0]
+
+    preferred = []
+    deferred = []
+    for image_id in positive:
+        score = scores[image_id]
+        redundant = any(
+            scores[higher_id] > score
+            and 0.0 <= triangulation_angle_matrix[image_id][higher_id] < 1.0
+            for higher_id in preferred
+        )
+        (deferred if redundant else preferred).append(image_id)
+
+    return (preferred + deferred + zero_score)[:max_candidates]
 
 def processing_single_scene(args):
 
@@ -413,6 +441,7 @@ def processing_single_scene(args):
 
     # view selection
     score = np.zeros((len(images), len(images)))
+    triangulation_angles = np.full((len(images), len(images)), -1.0)
     queue = []
     for i in range(len(images)):
         for j in range(i + 1, len(images)):
@@ -421,14 +450,17 @@ def processing_single_scene(args):
     p = mp.Pool(processes=mp.cpu_count())
     func = partial(calc_score, images=images, points3d=points3d, args=args, extrinsic=extrinsic)
     result = p.map(func, queue)
-    for i, j, s in result:
+    for i, j, s, angle in result:
         score[i, j] = s
         score[j, i] = s
+        triangulation_angles[i, j] = angle
+        triangulation_angles[j, i] = angle
     view_sel = []
     num_view = min(20, len(images) - 1)
     for i in range(len(images)):
-        sorted_score = np.argsort(score[i])[::-1]
-        view_sel.append([(k, score[i, k]) for k in sorted_score[:num_view]])
+        ordered_sources = rank_view_candidates(
+            score[i], triangulation_angles, num_view)
+        view_sel.append([(k, score[i, k]) for k in ordered_sources])
     print('view_sel[0]\n', view_sel[0], end='\n\n')
 
     # write
