@@ -57,7 +57,6 @@ void RescaleMatToTargetSize(const cv::Mat &src, cv::Mat &dst, const cv::Size2i &
 
 void RunFusion(const path &dense_folder, const std::vector<Problem> &problems,
 	int simple_region_stride = 1, bool plane_fusion = false, int plane_sample_stride = 4,
-	bool texture_view_pair_prior = false, bool global_texture_view_pair_prior = false,
 	bool adaptive_geometry_density = false);
 void RunFusion_TAT_Intermediate(const path &dense_folder, const std::vector<Problem> &problems);
 void RunFusion_TAT_advanced(const path &dense_folder, const std::vector<Problem> &problems);
@@ -78,7 +77,6 @@ struct DataPassHelper {
 	float4 *plane_hypotheses_cuda;
 	curandState *rand_states_cuda;
 	unsigned int *selected_views_cuda;
-	int2 *texture_view_pair_prior_cuda;
 	short2 *neighbours_cuda;
 	int *neighbours_map_cuda;
 	uchar *weak_info_cuda;
@@ -214,8 +212,6 @@ private:
 	// vis info
 	cv::Mat selected_views_host;
 	unsigned int *selected_views_cuda;
-	cv::Mat texture_view_pair_prior_host;
-	int2 *texture_view_pair_prior_cuda = nullptr;
 	// for easy data pass
 	DataPassHelper helper_host;
 	DataPassHelper *helper_cuda;
