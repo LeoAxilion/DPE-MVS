@@ -981,52 +981,50 @@ void DPE::InuputInitialization() {
 	// get folder
 	path image_folder = problem.dense_folder / path("images");
 	path cam_folder = problem.dense_folder / path("cams");
-	//path weak_folder = problem.dense_folder / path("weaks");
-	// =================================================
-	// read ref image and src images
-	// ref
-	{ 
-		path ref_image_path = image_folder / path(ToFormatIndex(problem.ref_image_id) + ".jpg");
-		cv::Mat_<uint8_t> image_uint = cv::imread(ref_image_path.string(), cv::IMREAD_GRAYSCALE);
+	// Load and scale each view before loading the next one. This follows the
+	// HPM path and avoids holding every full-resolution float image at once.
+	auto append_scaled_view = [&](int image_id) {
+		const std::string image_name = ToFormatIndex(image_id);
+		const path image_path = image_folder / path(image_name + ".jpg");
+		cv::Mat_<uint8_t> image_uint = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
+		if (image_uint.empty()) {
+			throw std::runtime_error("Cannot read image: " + image_path.string());
+		}
+		const int original_width = image_uint.cols;
+		const int original_height = image_uint.rows;
+		const cv::Size target = PyramidLevelImageSize(original_width, original_height,
+			problem.params.initial_image_scale, problem.scale_size);
+		const float sx = target.width / static_cast<float>(original_width);
+		const float sy = target.height / static_cast<float>(original_height);
+
 		cv::Mat image_float;
 		image_uint.convertTo(image_float, CV_32FC1);
-		images.push_back(image_float);
-		width = image_float.cols;
-		height = image_float.rows;
-	}
-	// src
+		if (target != image_float.size()) {
+			cv::Mat scaled_image;
+			cv::resize(image_float, scaled_image, target, 0, 0, cv::INTER_LINEAR);
+			image_float = std::move(scaled_image);
+		}
+
+		const path camera_path = cam_folder / path(image_name + "_cam.txt");
+		Camera camera;
+		ReadCamera(camera_path, camera);
+		camera.K[0] *= sx; camera.K[2] *= sx;
+		camera.K[4] *= sy; camera.K[5] *= sy;
+		camera.width = target.width;
+		camera.height = target.height;
+
+		images.push_back(std::move(image_float));
+		cameras.push_back(camera);
+	};
+	append_scaled_view(problem.ref_image_id);
+	width = images[0].cols;
+	height = images[0].rows;
 	for (const auto &src_idx : problem.src_image_ids) {
-		path src_image_path = image_folder / path(ToFormatIndex(src_idx) + ".jpg");
-		cv::Mat_<uint8_t> image_uint = cv::imread(src_image_path.string(), cv::IMREAD_GRAYSCALE);
-		cv::Mat image_float;
-		image_uint.convertTo(image_float, CV_32FC1);
-		images.push_back(image_float);
-		// assert: images_float.cols == width;
-		// assert: images_float.rows == height;
+		append_scaled_view(src_idx);
 	}
 	if (images.size() > MAX_IMAGES) {
 		std::cerr << "Can't process so much images: " << images.size() << std::endl;
 		exit(EXIT_FAILURE);
-	}
-	// =================================================
-	// read ref camera and src camera
-	// ref
-	{
-		path ref_cam_path = cam_folder / path(ToFormatIndex(problem.ref_image_id) + "_cam.txt");
-		Camera cam;
-		ReadCamera(ref_cam_path, cam);
-		cam.width = width;
-		cam.height = height;
-		cameras.push_back(cam);
-	}
-	// src
-	for (const auto &src_idx : problem.src_image_ids) {
-		path src_cam_path = cam_folder / path(ToFormatIndex(src_idx) + "_cam.txt");
-		Camera cam;
-		ReadCamera(src_cam_path, cam);
-		cam.width = width;
-		cam.height = height;
-		cameras.push_back(cam);
 	}
 	// =================================================
 	// set some params
@@ -1039,45 +1037,7 @@ void DPE::InuputInitialization() {
 	std::cout << "Depth range: " << params_host.depth_min << " " << params_host.depth_max << std::endl;
 	std::cout << "Num images: " << params_host.num_images << std::endl;
 	// =================================================
-	// scale images
-    // Limit the base image before the existing power-of-two pyramid.
-    for (int i = 0; i < num_images; ++i) {
-        const cv::Size target = LimitedImageSize(images[i].cols, images[i].rows, problem.params.max_image_size);
-        const float sx = target.width / static_cast<float>(images[i].cols);
-        const float sy = target.height / static_cast<float>(images[i].rows);
-        if (target != images[i].size()) {
-            cv::resize(images[i], images[i], target, 0, 0, cv::INTER_LINEAR);
-            cameras[i].K[0] *= sx; cameras[i].K[2] *= sx;
-            cameras[i].K[4] *= sy; cameras[i].K[5] *= sy;
-        }
-        cameras[i].width = target.width; cameras[i].height = target.height;
-    }
-    width = images[0].cols; height = images[0].rows;
-	if (problem.scale_size != 1) {
-		for (int i = 0; i < num_images; ++i) {
-			const float factor = 1.0f / (float)(problem.scale_size);
-			const int new_cols = std::round(images[i].cols * factor);
-			const int new_rows = std::round(images[i].rows * factor);
-
-			const float scale_x = new_cols / static_cast<float>(images[i].cols);
-			const float scale_y = new_rows / static_cast<float>(images[i].rows);
-
-			cv::Mat_<float> scaled_image_float;
-			cv::resize(images[i], scaled_image_float, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
-			images[i] = scaled_image_float.clone();
-
-			width = scaled_image_float.cols;
-			height = scaled_image_float.rows;
-
-			cameras[i].K[0] *= scale_x;
-			cameras[i].K[2] *= scale_x;
-			cameras[i].K[4] *= scale_y;
-			cameras[i].K[5] *= scale_y;
-			cameras[i].width = width;
-			cameras[i].height = height;
-		}
-		std::cout << "Scale images and cameras done\n";
-	}
+	std::cout << "Read and directly scale images and cameras to pyramid level\n";
 	std::cout << "Image size: " << width << " * " << height << std::endl;
 	// =================================================
 	// read depth form geom consistency
@@ -1354,7 +1314,7 @@ void DPE::SupportInitialization() {
 	if (problem.params.use_edge || problem.params.use_limit) {
 		int scale = 0;
 		while((1 << scale) < problem.scale_size) scale++;
-		path edge_path = problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
+		path edge_path = problem.result_folder / path("edges_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(scale) + ".dmb");
 		// read image edge info
 		ReadBinMat(edge_path, edge_host);
 
@@ -1364,14 +1324,14 @@ void DPE::SupportInitialization() {
 		} else {
 			max_scale = scale;
 		}
-		path edge_low_res_path = problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(max_scale) + ".dmb");
+		path edge_low_res_path = problem.result_folder / path("edges_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(max_scale) + ".dmb");
 		ReadBinMat(edge_low_res_path, edge_low_res_host);
 		low_width = edge_low_res_host.cols;
 		low_height = edge_low_res_host.rows;
 	}
 
 	if (problem.params.use_label) {
-		path label_path = problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
+		path label_path = problem.result_folder / path("labels_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(scale) + ".dmb");
 		ReadBinMat(label_path, label_host);
 	}
 

@@ -27,15 +27,19 @@ No speedup or reconstruction improvement has been measured yet. Fusion OOM is
 not addressed. Validate on separate copies with identical resolutions, pair lists,
 seeds/settings and compare depth error/completeness plus stage runtime.
 
-## Maximum image size
+## Initial image scale
 
-Default longest edge is now 3200; use `--max-image-size 0` for original resolution.
-Example: `build-max-size/DPE INPUT 0 --geometric-anchor-cost --max-image-size 3200`.
-Resizing is in memory, preserving original images/cameras. Never upscales. Intrinsics
-use actual rounded width/height ratios. Pyramid edges and input processing use the
-same capped dimensions; fusion rescales original color images/intrinsics to depth
-map sizes and masks use nearest-neighbor resizing. Edge caches include the cap in
-filenames. Outputs remain INPUT/DPE (back up previous results for comparison).
-Existing same-size input requirement remains. Changing the limit requires rerunning
-depth estimation, not mixing previous depth files. Build-max-size is separate so an
-already-running batch continues using its existing executable.
+The default `--initial-image-scale` is 4, setting the pyramid's finest image
+dimensions to about one quarter of the original. Each pyramid-level image is
+resized directly from the original in one interpolation pass. Use
+`--initial-image-scale 1` to keep the original resolution. Example:
+`build-max-size/DPE INPUT 0 --geometric-anchor-cost --initial-image-scale 4`.
+Resizing is in memory; original images remain unchanged. Camera intrinsics use
+the actual final width and height ratios. Pyramid edge maps and labels are
+generated from the same direct per-level resize. Fusion rescales original color
+images/intrinsics to depth-map sizes and masks use nearest-neighbor resizing.
+Direct-resize edge caches use distinct filenames from older two-stage caches.
+Outputs remain INPUT/DPE (back up previous
+results for comparison). Changing the scale requires rerunning depth estimation,
+not mixing previous depth files. Build-max-size is separate so an already-running
+batch continues using its existing executable.

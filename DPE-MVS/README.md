@@ -40,6 +40,15 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
     Run ./DPE $data_folder to get reconstruction results.
     The result will be saved in the folder $data_folder/DPE, and the point cloud is saved as "DPE.ply"
 
+- Initial image scale
+>
+    ./DPE $data_folder 0 --initial-image-scale 4
+
+  `--initial-image-scale N` defaults to `4` and sets the pyramid's finest
+  resolution to approximately `1/N` of the original in each dimension. Each
+  pyramid-level image is resized directly from the original in one interpolation
+  pass. Use `1` for the original image resolution. Input images on disk are not modified.
+
 - Fuse existing depth maps only
 >
     ./DPE $data_folder 0 --fuse
@@ -74,7 +83,7 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
 
 - Experimental adaptive refinement and point sampling
 >
-    ./DPE $data_folder 0 --max-image-size 3200 --adaptive-refinement \
+    ./DPE $data_folder 0 --initial-image-scale 4 --adaptive-refinement \
       --adaptive-point-sampling --simple-region-stride 2
 
   `--adaptive-refinement` keeps the depth maps dense but stops updating pixels
@@ -126,11 +135,11 @@ The code has been tested on Ubuntu 20.04 with Nvidia RTX 3090.
 
   `--min-pyramid-levels N` keeps at least `N` pyramid levels even when the
   image-size rule would normally produce fewer. `--pyramid-levels N` instead
-  selects exactly `N` levels, including the final full-resolution level capped
-  by `--max-image-size`; it is mutually exclusive with
-  `--min-pyramid-levels`. For example, with `--max-image-size 800`,
-  `--pyramid-levels 3` processes 200, 400, and 800 pixels along the longest
-  image dimension.
+  selects exactly `N` levels, including the final level at the configured
+  `--initial-image-scale` resolution; it is mutually exclusive with
+  `--min-pyramid-levels`. For example, if the input longest edge is 3200 pixels,
+  `--initial-image-scale 4 --pyramid-levels 3` processes approximately 200, 400,
+  and 800 pixels along the longest image dimension.
 
 If you need to filter out the sky during point cloud fusion, you can use a segmentation approach. Please refer to [MP-MVS](https://github.com/RongxuanTan/MP-MVS) and save the segmentation results in the $data_folder/blocks directory.
 

@@ -79,28 +79,32 @@ void GetProblemEdges(const Problem &problem) {
 
 	path image_folder = problem.dense_folder / path("images");
 	path image_path = image_folder / path(ToFormatIndex(problem.ref_image_id) + ".jpg");
-	cv::Mat image_uint = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
-	cv::Mat src_img;
-	const cv::Size capped = LimitedImageSize(image_uint.cols, image_uint.rows, problem.params.max_image_size);
-    if (capped != image_uint.size()) cv::resize(image_uint, image_uint, capped, 0, 0, cv::INTER_LINEAR);
-    image_uint.convertTo(src_img, CV_32FC1);
-	const float factor = 1.0f / (float)(problem.scale_size);
-	const int new_cols = std::round(src_img.cols * factor);
-	const int new_rows = std::round(src_img.rows * factor);
+	const cv::Mat original_image = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
+	if (original_image.empty()) {
+		throw std::runtime_error("Cannot read image for edge extraction: " + image_path.string());
+	}
+	const cv::Size target = PyramidLevelImageSize(original_image.cols, original_image.rows,
+		problem.params.initial_image_scale, problem.scale_size);
+	const int new_cols = target.width;
+	const int new_rows = target.height;
+	cv::Mat src_float;
+	original_image.convertTo(src_float, CV_32FC1);
 	cv::Mat scaled_image_float;
-	cv::resize(src_img, scaled_image_float, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
+	if (target == original_image.size()) scaled_image_float = src_float;
+	else cv::resize(src_float, scaled_image_float, target, 0, 0, cv::INTER_LINEAR);
+	cv::Mat src_img;
 	scaled_image_float.convertTo(src_img, CV_8UC1);
 	std::cout << "size: " << new_cols << "x" << new_rows << "\n";
 
 	if (problem.params.use_edge) {
 		// path edge_path = problem.result_folder / path("edges.dmb");
-		path edge_path = problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
+		path edge_path = problem.result_folder / path("edges_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(scale) + ".dmb");
 		std::ifstream edge_file(edge_path.string());
 		bool edge_exists = edge_file.good();
 		edge_file.close();
 		if (!edge_exists) {
 			std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-			cv::Mat edge = EdgeSegment(scale, src_img, 0, true, problem.params.high_res_img);
+			cv::Mat edge = EdgeSegment(0, src_img, 0, true, problem.params.high_res_img);
 			std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 			std::cout << "Fine edge cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
 			WriteBinMat(edge_path, edge);
@@ -113,19 +117,19 @@ void GetProblemEdges(const Problem &problem) {
 
 	if (problem.params.use_label) {
 		// path label_path = problem.result_folder / path("labels.dmb");
-		path label_path = problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb");
+		path label_path = problem.result_folder / path("labels_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(scale) + ".dmb");
 		std::ifstream label_file(label_path.string());
 		bool label_exists = label_file.good();
 		label_file.close();
 		if (!label_exists) {
 			std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-			cv::Mat label = EdgeSegment(scale, image_uint, 1, false, problem.params.high_res_img);
+			cv::Mat label = EdgeSegment(0, src_img, 1, false, problem.params.high_res_img);
 			std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 			std::cout << "Coarse edge cost time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << " ms" << std::endl;
 			WriteBinMat(label_path, label);
 			if (problem.show_medium_result) {
 				path ref_image_con_path = problem.result_folder / path("connect_" + std::to_string(scale) + ".jpg");
-				cv::imwrite(ref_image_con_path.string(), EdgeSegment(scale, image_uint, -1, false, problem.params.high_res_img));
+				cv::imwrite(ref_image_con_path.string(), EdgeSegment(0, src_img, -1, false, problem.params.high_res_img));
 			}
 		}
 	}
@@ -138,9 +142,9 @@ void GetProblemEdges(const Problem &problem) {
 // many gigabytes for high-resolution datasets, so release the completed
 // scale before moving to the next one.
 void RemoveScaleCaches(const Problem &problem, int scale) {
-	for (const char *prefix : {"edges_max", "labels_max"}) {
+	for (const char *prefix : {"edges_direct_scale", "labels_direct_scale"}) {
 		remove(problem.result_folder / path(std::string(prefix) +
-			std::to_string(problem.params.max_image_size) + "_" + std::to_string(scale) + ".dmb"));
+			std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(scale) + ".dmb"));
 	}
 }
 
@@ -157,8 +161,8 @@ int ComputeRoundNum(const std::vector<Problem> &problems, int min_pyramid_levels
 	if (image.empty()) {
 		return 0;
 	}
-	const cv::Size capped = LimitedImageSize(image.cols, image.rows, problems[0].params.max_image_size);
-	int max_size = MAX(capped.width, capped.height);
+	const cv::Size scaled = ScaledImageSize(image.cols, image.rows, problems[0].params.initial_image_scale);
+	int max_size = MAX(scaled.width, scaled.height);
 	int round_num = 1;
 	while (max_size > 800) {
 		max_size /= 2;
@@ -275,7 +279,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "USAGE: DPE dense_folder [gpu_index] [--fuse] "
                      "[--geometric-anchor-cost] "
-					 "[--max-image-size N] "
+					 "[--initial-image-scale N] "
                      "[--show-medium-result] "
 					 "[--adaptive-refinement] "
 					 "[--adaptive-refinement-aggressiveness 1|2|3] "
@@ -290,7 +294,7 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     path dense_folder(argv[1]);
-    int gpu_index = 0, max_image_size = 3200;
+    int gpu_index = 0, initial_image_scale = 4;
 	bool fuse_only = false;
     bool geometric_anchor_cost = false;
     bool show_medium_result = false;
@@ -380,11 +384,12 @@ int main(int argc, char **argv) {
                 if (end != value.size() || start_round < 0)
                     throw std::invalid_argument("start-round must be >= 0");
             }
-            else if (option == "--max-image-size" && arg < argc) {
+            else if (option == "--initial-image-scale" && arg < argc) {
                 const std::string value(argv[arg++]);
                 size_t end = 0;
-                max_image_size = std::stoi(value, &end);
-                if (end != value.size() || max_image_size < 0) throw std::invalid_argument("invalid size");
+                initial_image_scale = std::stoi(value, &end);
+                if (end != value.size() || initial_image_scale < 1)
+                    throw std::invalid_argument("initial-image-scale must be an integer >= 1 (1 = original resolution)");
             } else throw std::invalid_argument("unknown or incomplete option: " + option);
         }
 		if (regional_adaptive_pyramid) adaptive_geometry_density = true;
@@ -397,7 +402,8 @@ int main(int argc, char **argv) {
     }
     path output_folder = dense_folder / path(OUT_NAME);
     create_directory(output_folder);
-    std::cout << "Maximum image size: " << max_image_size << " (0 = original)" << std::endl;
+	std::cout << "Initial image scale: 1/" << initial_image_scale
+		<< " (width and height are each scaled by 1/" << initial_image_scale << ")" << std::endl;
 	// generate problems
 	std::vector<Problem> problems;
 	GenerateSampleList(dense_folder, problems, show_medium_result);
@@ -407,7 +413,7 @@ int main(int argc, char **argv) {
         problem.params.adaptive_refinement_aggressiveness = adaptive_refinement_aggressiveness;
 		problem.params.adaptive_geometry_density = adaptive_geometry_density;
 		problem.params.regional_adaptive_pyramid = regional_adaptive_pyramid;
-        problem.params.max_image_size = max_image_size;
+        problem.params.initial_image_scale = initial_image_scale;
     }
 	std::cout << "Geometric anchor cost: " << geometric_anchor_cost << std::endl;
 	std::cout << "Adaptive refinement: " << adaptive_refinement << " (aggressiveness "
@@ -583,8 +589,8 @@ int main(int argc, char **argv) {
 			remove(problem.result_folder / path("neighbour.bin")); 
 			remove(problem.result_folder / path("neighbour_map.bin"));
 			for (int j = 0; j < round_num; j++) {
-				remove(problem.result_folder / path("edges_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(j) + ".dmb"));
-				remove(problem.result_folder / path("labels_max" + std::to_string(problem.params.max_image_size) + "_" + std::to_string(j) + ".dmb"));
+				remove(problem.result_folder / path("edges_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(j) + ".dmb"));
+				remove(problem.result_folder / path("labels_direct_scale" + std::to_string(problem.params.initial_image_scale) + "_" + std::to_string(j) + ".dmb"));
 			}
 		}
 	}

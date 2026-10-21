@@ -80,7 +80,7 @@ enum PixelState {
 
 struct PatchMatchParams {
 	int max_iterations = 3;
-	int max_image_size = 3200; // 0 keeps input resolution.
+	int initial_image_scale = 4; // N scales both image dimensions to approximately 1/N.
 	bool geometric_anchor_cost = false; // Opt-in experimental replacement of anchor NCC.
 	bool adaptive_refinement = false; // Skip fine-scale PatchMatch updates on stable planar strong pixels.
 	int adaptive_refinement_aggressiveness = 1; // 1=conservative, 2=balanced, 3=aggressive planar consensus.
@@ -144,13 +144,24 @@ struct Problem {
 		std::make_shared<AdaptiveRefinementState>();
 };
 
-// Shared sizing rule for image, intrinsics and edge pyramids; never upscale.
-inline cv::Size LimitedImageSize(int width, int height, int limit) {
-    const int longest = std::max(width, height);
-    if (limit <= 0 || longest <= limit) return cv::Size(width, height);
-    const double factor = static_cast<double>(limit) / longest;
-    return cv::Size(std::max(1, static_cast<int>(std::round(width * factor))),
-                    std::max(1, static_cast<int>(std::round(height * factor))));
+// Shared sizing rule for images, intrinsics, and edge pyramids. N=1 keeps
+// the input dimensions; N=4 scales width and height to approximately 1/4.
+inline cv::Size ScaledImageSize(int width, int height, int scale) {
+    if (scale <= 1) return cv::Size(width, height);
+    return cv::Size(
+        std::max(1, static_cast<int>(std::round(width / static_cast<double>(scale)))),
+        std::max(1, static_cast<int>(std::round(height / static_cast<double>(scale)))));
+}
+
+// Preserve existing pyramid dimensions while resizing directly from the
+// original image to one pyramid level in a single interpolation pass.
+inline cv::Size PyramidLevelImageSize(int width, int height, int initial_scale,
+	int pyramid_scale) {
+	const cv::Size base = ScaledImageSize(width, height, initial_scale);
+	if (pyramid_scale <= 1) return base;
+	return cv::Size(
+		std::max(1, static_cast<int>(std::round(base.width / static_cast<double>(pyramid_scale)))),
+		std::max(1, static_cast<int>(std::round(base.height / static_cast<double>(pyramid_scale)))));
 }
 
 #endif // !_MAIN_H_
