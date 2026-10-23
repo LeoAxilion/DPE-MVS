@@ -126,6 +126,8 @@ struct AdaptiveRefinementState {
 	cv::Mat density_keep;
 };
 
+class ScaledImageCache;
+
 struct Problem {
 	int index;
 	int ref_image_id;
@@ -139,10 +141,39 @@ struct Problem {
 	// Geometry-aware density mode updates its mask only at the end of a scale;
 	// the final scale keeps the inherited mask for sparse fusion sampling.
 	bool update_adaptive_mask = true;
+	std::shared_ptr<ScaledImageCache> scaled_image_cache;
 	// Shared by successive DPE instances for this image; checkpointed per scale.
 	std::shared_ptr<AdaptiveRefinementState> adaptive_state =
 		std::make_shared<AdaptiveRefinementState>();
 };
+
+// Per-process cache for the already prepared image files of the active
+// pyramid scale. Retain() drops views not used by the next ProcessProblem.
+class ScaledImageCache {
+public:
+	explicit ScaledImageCache(size_t capacity);
+	void Retain(const std::vector<int> &image_ids);
+	void SetOriginalSize(int image_id, const cv::Size &size);
+	cv::Size OriginalSize(int image_id) const;
+	cv::Mat Get(int image_id, const path &scaled_image_path);
+	void Clear();
+	void ResetStats();
+	size_t CacheHits() const { return cache_hits; }
+	size_t CacheMisses() const { return cache_misses; }
+	double DiskReadSeconds() const { return disk_read_seconds; }
+	size_t Capacity() const { return capacity; }
+
+private:
+	size_t capacity;
+	size_t cache_hits = 0;
+	size_t cache_misses = 0;
+	double disk_read_seconds = 0.0;
+	std::unordered_map<int, cv::Mat> images;
+	std::unordered_map<int, cv::Size> original_sizes;
+};
+
+path ScaledImagePath(const path &dense_folder, int image_id,
+	int initial_image_scale, int pyramid_scale);
 
 // Shared sizing rule for images, intrinsics, and edge pyramids. N=1 keeps
 // the input dimensions; N=4 scales width and height to approximately 1/4.

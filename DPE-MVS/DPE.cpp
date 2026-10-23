@@ -530,6 +530,65 @@ bool ReadBinMat(const path &mat_path, cv::Mat &mat)
 
 }
 
+ScaledImageCache::ScaledImageCache(size_t max_images) : capacity(max_images) {
+	if (capacity == 0) throw std::invalid_argument("scaled-image cache capacity must be positive");
+}
+
+void ScaledImageCache::Retain(const std::vector<int> &image_ids) {
+	std::unordered_set<int> keep(image_ids.begin(), image_ids.end());
+	if (keep.size() > capacity) {
+		throw std::runtime_error("ProcessProblem image count exceeds scaled-image cache capacity");
+	}
+	for (auto it = images.begin(); it != images.end();) {
+		if (keep.find(it->first) == keep.end()) it = images.erase(it);
+		else ++it;
+	}
+}
+
+void ScaledImageCache::SetOriginalSize(int image_id, const cv::Size &size) {
+	original_sizes[image_id] = size;
+}
+
+cv::Size ScaledImageCache::OriginalSize(int image_id) const {
+	auto it = original_sizes.find(image_id);
+	if (it == original_sizes.end()) {
+		throw std::runtime_error("Original dimensions are missing for scaled source image " +
+			std::to_string(image_id));
+	}
+	return it->second;
+}
+
+cv::Mat ScaledImageCache::Get(int image_id, const path &scaled_image_path) {
+	auto it = images.find(image_id);
+	if (it != images.end()) {
+		++cache_hits;
+		return it->second;
+	}
+	if (images.size() >= capacity) {
+		throw std::runtime_error("Scaled-image cache is full; Retain() must run before ProcessProblem");
+	}
+	cv::Mat image;
+	const auto started = std::chrono::steady_clock::now();
+	if (!ReadBinMat(scaled_image_path, image) || image.type() != CV_32FC1 || image.empty()) {
+		throw std::runtime_error("Cannot load prepared scaled image: " + scaled_image_path.string());
+	}
+	disk_read_seconds += std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - started).count();
+	++cache_misses;
+	images.emplace(image_id, image);
+	return image;
+}
+
+void ScaledImageCache::Clear() {
+	images.clear();
+}
+
+void ScaledImageCache::ResetStats() {
+	cache_hits = 0;
+	cache_misses = 0;
+	disk_read_seconds = 0.0;
+}
+
 bool WriteBinMat(const path &mat_path, const cv::Mat &mat) {
 
 	ofstream out(mat_path, std::ios_base::binary);
@@ -978,32 +1037,19 @@ DPE::~DPE() {
 void DPE::InuputInitialization() {
 	images.clear();
 	cameras.clear();
-	// get folder
-	path image_folder = problem.dense_folder / path("images");
+	if (!problem.scaled_image_cache) {
+		throw std::runtime_error("ProcessProblem has no prepared scaled-image cache");
+	}
 	path cam_folder = problem.dense_folder / path("cams");
-	// Load and scale each view before loading the next one. This follows the
-	// HPM path and avoids holding every full-resolution float image at once.
-	auto append_scaled_view = [&](int image_id) {
+	auto append_prepared_view = [&](int image_id) {
 		const std::string image_name = ToFormatIndex(image_id);
-		const path image_path = image_folder / path(image_name + ".jpg");
-		cv::Mat_<uint8_t> image_uint = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
-		if (image_uint.empty()) {
-			throw std::runtime_error("Cannot read image: " + image_path.string());
-		}
-		const int original_width = image_uint.cols;
-		const int original_height = image_uint.rows;
-		const cv::Size target = PyramidLevelImageSize(original_width, original_height,
+		const path scaled_path = ScaledImagePath(problem.dense_folder, image_id,
 			problem.params.initial_image_scale, problem.scale_size);
-		const float sx = target.width / static_cast<float>(original_width);
-		const float sy = target.height / static_cast<float>(original_height);
-
-		cv::Mat image_float;
-		image_uint.convertTo(image_float, CV_32FC1);
-		if (target != image_float.size()) {
-			cv::Mat scaled_image;
-			cv::resize(image_float, scaled_image, target, 0, 0, cv::INTER_LINEAR);
-			image_float = std::move(scaled_image);
-		}
+		cv::Mat image_float = problem.scaled_image_cache->Get(image_id, scaled_path);
+		const cv::Size original_size = problem.scaled_image_cache->OriginalSize(image_id);
+		const cv::Size target = image_float.size();
+		const float sx = target.width / static_cast<float>(original_size.width);
+		const float sy = target.height / static_cast<float>(original_size.height);
 
 		const path camera_path = cam_folder / path(image_name + "_cam.txt");
 		Camera camera;
@@ -1016,11 +1062,11 @@ void DPE::InuputInitialization() {
 		images.push_back(std::move(image_float));
 		cameras.push_back(camera);
 	};
-	append_scaled_view(problem.ref_image_id);
+	append_prepared_view(problem.ref_image_id);
 	width = images[0].cols;
 	height = images[0].rows;
 	for (const auto &src_idx : problem.src_image_ids) {
-		append_scaled_view(src_idx);
+		append_prepared_view(src_idx);
 	}
 	if (images.size() > MAX_IMAGES) {
 		std::cerr << "Can't process so much images: " << images.size() << std::endl;

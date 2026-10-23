@@ -4,6 +4,62 @@
 
 using namespace boost::filesystem;
 
+path ScaledImagePath(const path &dense_folder, int image_id,
+	int initial_image_scale, int pyramid_scale) {
+	const path image_result = dense_folder / path(OUT_NAME) / path(ToFormatIndex(image_id));
+	return image_result / path("scaled_image_initial" + std::to_string(initial_image_scale) +
+		"_pyramid" + std::to_string(pyramid_scale) + ".dmb");
+}
+
+std::vector<path> PrepareScaleImages(const std::vector<Problem> &problems,
+	int pyramid_scale, ScaledImageCache &cache) {
+	std::unordered_set<int> image_ids;
+	for (const auto &problem : problems) {
+		image_ids.insert(problem.ref_image_id);
+		image_ids.insert(problem.src_image_ids.begin(), problem.src_image_ids.end());
+	}
+	std::vector<path> files;
+	files.reserve(image_ids.size());
+	const auto started = std::chrono::steady_clock::now();
+	size_t completed = 0;
+	for (const int image_id : image_ids) {
+		const path image_path = problems.front().dense_folder / path("images") /
+			path(ToFormatIndex(image_id) + ".jpg");
+		cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
+		if (image.empty()) throw std::runtime_error("Cannot read image: " + image_path.string());
+		const cv::Size original_size = image.size();
+		const cv::Size target = PyramidLevelImageSize(original_size.width, original_size.height,
+			problems.front().params.initial_image_scale, pyramid_scale);
+		cache.SetOriginalSize(image_id, original_size);
+		cv::Mat image_float, scaled;
+		image.convertTo(image_float, CV_32FC1);
+		if (target == image_float.size()) scaled = image_float;
+		else cv::resize(image_float, scaled, target, 0, 0, cv::INTER_LINEAR);
+		const path scaled_path = ScaledImagePath(problems.front().dense_folder, image_id,
+			problems.front().params.initial_image_scale, pyramid_scale);
+		if (exists(scaled_path)) remove(scaled_path);
+		if (!WriteBinMat(scaled_path, scaled)) {
+			throw std::runtime_error("Cannot write prepared scaled image: " + scaled_path.string());
+		}
+		files.push_back(scaled_path);
+		if (++completed % 20 == 0 || completed == image_ids.size()) {
+			std::cout << "Prepared scaled images " << completed << "/" << image_ids.size()
+				<< " for pyramid scale " << pyramid_scale << std::endl;
+		}
+	}
+	std::cout << "Prepared " << files.size() << " scaled image files for pyramid scale "
+		<< pyramid_scale << " in "
+		<< std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+		<< " s" << std::endl;
+	return files;
+}
+
+void RemoveScaleImageFiles(const std::vector<path> &files) {
+	for (const auto &file : files) {
+		if (exists(file)) remove(file);
+	}
+}
+
 void GenerateSampleList(const path &dense_folder, std::vector<Problem> &problems,
 	bool show_medium_result)
 {
@@ -77,21 +133,16 @@ void GetProblemEdges(const Problem &problem) {
 	int scale = 0;
 	while((1 << scale) < problem.scale_size) scale++;
 
-	path image_folder = problem.dense_folder / path("images");
-	path image_path = image_folder / path(ToFormatIndex(problem.ref_image_id) + ".jpg");
-	const cv::Mat original_image = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
-	if (original_image.empty()) {
-		throw std::runtime_error("Cannot read image for edge extraction: " + image_path.string());
-	}
-	const cv::Size target = PyramidLevelImageSize(original_image.cols, original_image.rows,
+	const path scaled_image_path = ScaledImagePath(problem.dense_folder, problem.ref_image_id,
 		problem.params.initial_image_scale, problem.scale_size);
-	const int new_cols = target.width;
-	const int new_rows = target.height;
-	cv::Mat src_float;
-	original_image.convertTo(src_float, CV_32FC1);
 	cv::Mat scaled_image_float;
-	if (target == original_image.size()) scaled_image_float = src_float;
-	else cv::resize(src_float, scaled_image_float, target, 0, 0, cv::INTER_LINEAR);
+	if (!ReadBinMat(scaled_image_path, scaled_image_float) ||
+		scaled_image_float.type() != CV_32FC1 || scaled_image_float.empty()) {
+		throw std::runtime_error("Cannot read prepared scaled image for edge extraction: " +
+			scaled_image_path.string());
+	}
+	const int new_cols = scaled_image_float.cols;
+	const int new_rows = scaled_image_float.rows;
 	cv::Mat src_img;
 	scaled_image_float.convertTo(src_img, CV_8UC1);
 	std::cout << "size: " << new_cols << "x" << new_rows << "\n";
@@ -176,6 +227,15 @@ float ProcessProblem(const Problem &problem) {
 	std::cout << "Processing image: " << std::setw(8) << std::setfill('0') << problem.ref_image_id << "..." << std::endl;
     std::cout << "iteration: " << problem.iteration << std::endl;
 	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	if (!problem.scaled_image_cache) {
+		throw std::runtime_error("ProcessProblem is missing its scaled-image cache");
+	}
+	std::vector<int> active_image_ids;
+	active_image_ids.reserve(problem.src_image_ids.size() + 1);
+	active_image_ids.push_back(problem.ref_image_id);
+	active_image_ids.insert(active_image_ids.end(), problem.src_image_ids.begin(),
+		problem.src_image_ids.end());
+	problem.scaled_image_cache->Retain(active_image_ids);
 
 	const bool profile = std::getenv("DPE_PROFILE") != nullptr;
 	auto profile_start = start;
@@ -457,29 +517,67 @@ int main(int argc, char **argv) {
 			<< (round_num - 1) << ").\n";
 		return EXIT_FAILURE;
 	}
+	size_t image_cache_capacity = 1;
+	for (const auto &problem : problems) {
+		std::unordered_set<int> process_images(problem.src_image_ids.begin(),
+			problem.src_image_ids.end());
+		process_images.insert(problem.ref_image_id);
+		image_cache_capacity = MAX(image_cache_capacity, process_images.size());
+	}
+	if (image_cache_capacity > MAX_IMAGES) {
+		std::cerr << "A ProcessProblem requires " << image_cache_capacity
+			<< " images, exceeding MAX_IMAGES=" << MAX_IMAGES << ".\n";
+		return EXIT_FAILURE;
+	}
+	auto scaled_image_cache = std::make_shared<ScaledImageCache>(image_cache_capacity);
 	for (auto &problem : problems) {
-		problem.params.max_scale_size = 1;
-		for (int i = 0; i < round_num; ++i) {
-			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
-			GetProblemEdges(problem); // 注意要先得到 scale_size
-			problem.params.max_scale_size = MAX(problem.scale_size, problem.params.max_scale_size);
-		}
+		problem.scaled_image_cache = scaled_image_cache;
+		problem.params.max_scale_size = static_cast<int>(std::pow(2, round_num - 1));
 	}
 
 	std::cout << "Round nums: " << round_num << std::endl;
+	std::cout << "Prepared-image cache capacity: " << image_cache_capacity
+		<< " views (shared decoded grayscale buffers; each scale's temporary files are removed "
+		<< "when that scale finishes)." << std::endl;
 	int iteration_index = start_round * 4;
 	std::vector<bool> early_stopped(problems.size(), false);
 	if (start_round > 0) {
 		std::cout << "Resuming from pyramid round " << start_round
 			<< " using the saved preceding-scale depth maps." << std::endl;
+		// Refinement at a later scale may reuse the coarsest edge map. Ensure it
+		// exists even when resuming in a fresh process, without keeping the
+		// coarsest scaled images on disk after edge extraction.
+		const int coarsest_scale = static_cast<int>(std::pow(2, round_num - 1));
+		std::vector<path> coarse_files = PrepareScaleImages(
+			problems, coarsest_scale, *scaled_image_cache);
+		for (auto &problem : problems) {
+			problem.scale_size = coarsest_scale;
+			problem.params.use_edge = true;
+			problem.params.use_label = true;
+			GetProblemEdges(problem);
+		}
+		scaled_image_cache->Clear();
+		RemoveScaleImageFiles(coarse_files);
 	}
 	for (int i = start_round; i < round_num; ++i) {
+		const auto scale_started = std::chrono::steady_clock::now();
+		const int pyramid_scale = static_cast<int>(std::pow(2, round_num - 1 - i));
+		for (auto &problem : problems) {
+			problem.scale_size = pyramid_scale;
+			problem.params.scale_size = pyramid_scale;
+			problem.params.use_edge = true;
+			problem.params.use_label = true;
+		}
+		const std::vector<path> scaled_image_files = PrepareScaleImages(
+			problems, pyramid_scale, *scaled_image_cache);
+		for (auto &problem : problems) GetProblemEdges(problem);
+		scaled_image_cache->ResetStats();
 		std::fill(early_stopped.begin(), early_stopped.end(), false);
 		for (auto &problem : problems) {
 			problem.iteration = iteration_index;
 			problem.update_adaptive_mask = !adaptive_geometry_density ||
 				((problem.iteration % 4 == 3) && (i + 1 < round_num));
-			problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
+			problem.scale_size = pyramid_scale;
 			problem.params.scale_size = problem.scale_size;
 			{
 				auto &params = problem.params;
@@ -518,7 +616,7 @@ int main(int argc, char **argv) {
 				problem.iteration = iteration_index;
 				problem.update_adaptive_mask = !adaptive_geometry_density ||
 					((problem.iteration % 4 == 3) && (i + 1 < round_num));
-				problem.scale_size = static_cast<int>(std::pow(2, round_num - 1 - i)); // scale 
+				problem.scale_size = pyramid_scale;
 				problem.params.scale_size = problem.scale_size;
 				{
 					auto &params = problem.params;
@@ -558,6 +656,12 @@ int main(int argc, char **argv) {
 					WriteBinMat(problem.result_folder / "adaptive_density_keep.dmb", state.density_keep);
 			}
 		}
+		std::cout << "Scaled-image cache at pyramid scale " << pyramid_scale << ": "
+			<< scaled_image_cache->CacheHits() << " hits, "
+			<< scaled_image_cache->CacheMisses() << " temp-file reads, "
+			<< scaled_image_cache->DiskReadSeconds() << " s reading scaled images.\n";
+		scaled_image_cache->Clear();
+		RemoveScaleImageFiles(scaled_image_files);
 		const int completed_scale = round_num - 1 - i;
 		for (const auto &problem : problems) {
 			// In high-resolution mode the coarsest edge map is reused as the
@@ -571,7 +675,9 @@ int main(int argc, char **argv) {
 				RemoveScaleCaches(problem, completed_scale);
 			}
 		}
-		std::cout << "Round: " << i << " done\n";
+		std::cout << "Round: " << i << " (pyramid scale " << pyramid_scale << ") done in "
+			<< std::chrono::duration<double>(std::chrono::steady_clock::now() - scale_started).count()
+			<< " s; temporary scaled images deleted.\n";
 	}
 
 	RunFusion(dense_folder, problems, adaptive_point_sampling ? simple_region_stride : 1,
